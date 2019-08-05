@@ -1,3 +1,5 @@
+#!/usr/bin/env node /** twilio.js */
+
 const http = require('http');
 const express = require('express');
 const MessagingResponse = require('twilio').twiml.MessagingResponse;
@@ -24,6 +26,12 @@ app.post('/sms/', (req, res) => {
   }
   else if (response.substring(0, 6) == 'remove') {
     command = 'remove';
+  }
+  else if (response.substring(0, 5) == 'clear') {
+    command = 'clear';
+  }
+  else if (response.substring(0, 8) == 'announce') {
+    command = 'announce';
   }
 
   //based upon the command sent by the user, the following will do certain
@@ -52,10 +60,13 @@ app.post('/sms/', (req, res) => {
           finalList = finalList + "\n" + (i + 1) + ". " + list[i];
         }
 
-        twiml.message({
+        twiml.message(/*{
+          ****************************
+          Currently disabled logging 
+          *****************************
           action: 'http://ec2-35-171-203-74.compute-1.amazonaws.com:8080/status/',
           method: 'POST'
-        }, finalList);
+        }, */finalList);
 
         //clear varibles that were used so they can be reused clean
         list, finalList = '';
@@ -93,8 +104,34 @@ app.post('/sms/', (req, res) => {
       //clear varibles that were used so they can be reused clean
       list, newList = '';
       break;
+    case 'clear':
+      var newList = '';
+      //read todo list file and load it into varible as an array using the 
+      //readList function
+      list = readList('./list.txt');
+      newList = '';
+      twiml.message("List cleared");
+      fs.writeFileSync('list.txt', newList);
+
+      console.log('List cleared');
+
+      //clear varibles that were used so they can be reused clean
+      list, newList = '';
+      break;
+    case 'announce':
+      const announcement = body.substring(9);
+      const accountSid = process.env.accountSID;
+      const authToken = process.env.authToken;
+      const client = require('twilio')(accountSid, authToken);
+      client.messages
+        .create({from: '+15034448534', body: announcement, to: '+15037812714'})
+        .then(console.log('Announment made: ' + announcement));
+      client.messages
+        .create({from: '+15034448534', body: announcement, to: '+15035449035'})
+        .then(console.log('Announment made: ' + announcement));
+      break;
     default:
-      twiml.message("Please respond with add {item}, list, or remove {item}");
+      twiml.message("Please respond with add {item}, remove {item}, list, or clear");
       break;
   }
 
@@ -102,9 +139,11 @@ app.post('/sms/', (req, res) => {
   res.end(twiml.toString());
 });
 
+/* ***********************
+Currently status logging disabled
 app.post('/status/', (req, res) => {
   console.log("Message Status: " + req.body.MessageStatus);
-});
+});*/
 
 http.createServer(app).listen(8080, () => {
   console.log('Express server listening on port 8080');
