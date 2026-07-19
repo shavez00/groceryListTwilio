@@ -6,14 +6,37 @@ const MessagingResponse = require('twilio').twiml.MessagingResponse;
 const bodyParser = require('body-parser');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const { SSMClient, GetParametersCommand } = require('@aws-sdk/client-ssm');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
 const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const ssm = new SSMClient({});
 const TENANTS_TABLE = process.env.TENANTS_TABLE || 'GroceryTenants';
 const LISTS_TABLE = process.env.LISTS_TABLE || 'GroceryLists';
 const DEFAULT_LIST = 'grocery';
+
+// Fetched once per cold start and cached for the lifetime of the Lambda container
+let twilioSecrets = null;
+async function getTwilioSecrets() {
+  if (twilioSecrets) return twilioSecrets;
+  const result = await ssm.send(new GetParametersCommand({
+    Names: [
+      '/grocerylist/twilio/accountSID',
+      '/grocerylist/twilio/apiKeySID',
+      '/grocerylist/twilio/apiKeySecret',
+    ],
+    WithDecryption: true,
+  }));
+  const map = Object.fromEntries(result.Parameters.map(p => [p.Name, p.Value]));
+  twilioSecrets = {
+    accountSID: map['/grocerylist/twilio/accountSID'],
+    apiKeySID: map['/grocerylist/twilio/apiKeySID'],
+    apiKeySecret: map['/grocerylist/twilio/apiKeySecret'],
+  };
+  return twilioSecrets;
+}
 
 async function readList(tenantId, listId = DEFAULT_LIST) {
   const result = await dynamo.send(new GetCommand({
@@ -111,10 +134,11 @@ app.post('/sms', async (req, res) => {
 
     case 'announce': {
       const announcement = body.substring(9).trim();
+      const secrets = await getTwilioSecrets();
       const client = require('twilio')(
-        process.env.apiKeySID,
-        process.env.apiKeySecret,
-        { accountSid: process.env.accountSID }
+        secrets.apiKeySID,
+        secrets.apiKeySecret,
+        { accountSid: secrets.accountSID }
       );
       const targets = ['+15037812714', '+15035449035'];
       await Promise.all(targets.map(to =>

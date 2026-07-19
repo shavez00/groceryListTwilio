@@ -22,9 +22,6 @@ Globals:
       Variables:
         TENANTS_TABLE: !Ref GroceryTenantsTable
         LISTS_TABLE: !Ref GroceryListsTable
-        accountSID: '{{resolve:ssm-secure:/grocerylist/twilio/accountSID}}'
-        apiKeySID: '{{resolve:ssm-secure:/grocerylist/twilio/apiKeySID}}'
-        apiKeySecret: '{{resolve:ssm-secure:/grocerylist/twilio/apiKeySecret}}'
 
 Resources:
 
@@ -41,6 +38,8 @@ Resources:
             TableName: !Ref GroceryTenantsTable
         - DynamoDBCrudPolicy:
             TableName: !Ref GroceryListsTable
+        - SSMParameterReadPolicy:
+            ParameterName: grocerylist/twilio/*
       Events:
         SmsWebhook:
           Type: HttpApi
