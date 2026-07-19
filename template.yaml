@@ -65,7 +65,9 @@ Resources:
 
   GroceryListApiMapping:
     Type: AWS::ApiGatewayV2::ApiMapping
-    DependsOn: GroceryListDomainName
+    DependsOn:
+      - GroceryListDomainName
+      - GroceryListApiApiGatewayDefaultStage
     Properties:
       DomainName: !Ref DomainName
       ApiId: !Ref GroceryListApi
