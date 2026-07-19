@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Grocery List Twilio webhook on Lambda + API Gateway + DynamoDB
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: grocerylist.vezcore.com
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for vezcore.com
+  AcmCertificateArn:
+    Type: String
+    Description: ARN of the ACM certificate for grocerylist.vezcore.com (must be pre-validated)
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 15
+    MemorySize: 128
+    Environment:
+      Variables:
+        TENANTS_TABLE: !Ref GroceryTenantsTable
+        LISTS_TABLE: !Ref GroceryListsTable
+        accountSID: !Sub '{{resolve:ssm:/grocerylist/twilio/accountSID}}'
+        apiKeySID: !Sub '{{resolve:ssm:/grocerylist/twilio/apiKeySID}}'
+        apiKeySecret: !Sub '{{resolve:ssm:/grocerylist/twilio/apiKeySecret}}'
+
+Resources:
+
+  # ── Lambda ──────────────────────────────────────────────────────────────────
+
+  GroceryListFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: grocery-list-twilio
+      CodeUri: .
+      Handler: twilio.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GroceryTenantsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GroceryListsTable
+      Events:
+        SmsWebhook:
+          Type: HttpApi
+          Properties:
+            Path: /sms
+            Method: POST
+            ApiId: !Ref GroceryListApi
+
+  # ── API Gateway ──────────────────────────────────────────────────────────────
+
+  GroceryListApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+
+  GroceryListDomainName:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref AcmCertificateArn
+          EndpointType: REGIONAL
+
+  GroceryListApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    DependsOn: GroceryListDomainName
+    Properties:
+      DomainName: !Ref DomainName
+      ApiId: !Ref GroceryListApi
+      Stage: $default
+
+  # ── Route 53 ─────────────────────────────────────────────────────────────────
+
+  GroceryListDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt GroceryListDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt GroceryListDomainName.RegionalHostedZoneId
+        EvaluateTargetHealth: false
+
+  # ── DynamoDB ──────────────────────────────────────────────────────────────────
+
+  GroceryTenantsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: GroceryTenants
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+
+  GroceryListsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: GroceryLists
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: listId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+        - AttributeName: listId
+          KeyType: RANGE
+
+Outputs:
+  ApiEndpoint:
+    Description: Default API Gateway endpoint
+    Value: !Sub 'https://${GroceryListApi}.execute-api.${AWS::Region}.amazonaws.com/sms'
+  CustomDomainEndpoint:
+    Description: Custom domain endpoint (active after DNS propagation)
+    Value: !Sub 'https://${DomainName}/sms'
+  GroceryListFunctionArn:
+    Value: !GetAtt GroceryListFunction.Arn

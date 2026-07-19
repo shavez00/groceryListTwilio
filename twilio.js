@@ -1,137 +1,131 @@
-#!/usr/bin/env node /** twilio.js */
+#!/usr/bin/env node
 
 const http = require('http');
 const express = require('express');
 const MessagingResponse = require('twilio').twiml.MessagingResponse;
 const bodyParser = require('body-parser');
-const fs = require('fs');
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 
 const app = express();
-
 app.use(bodyParser.urlencoded({ extended: false }));
 
-app.post('/sms/', (req, res) => {
-  const body = req.body.Body;
+const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const TENANTS_TABLE = process.env.TENANTS_TABLE || 'GroceryTenants';
+const LISTS_TABLE = process.env.LISTS_TABLE || 'GroceryLists';
+const DEFAULT_LIST = 'grocery';
+
+async function readList(tenantId, listId = DEFAULT_LIST) {
+  const result = await dynamo.send(new GetCommand({
+    TableName: LISTS_TABLE,
+    Key: { tenantId, listId },
+  }));
+  return result.Item?.items ?? [];
+}
+
+async function writeList(tenantId, items, modifiedBy, listId = DEFAULT_LIST) {
+  await dynamo.send(new PutCommand({
+    TableName: LISTS_TABLE,
+    Item: { tenantId, listId, items, updatedAt: new Date().toISOString(), lastModifiedBy: modifiedBy },
+  }));
+}
+
+async function isAuthorized(tenantId, fromNumber) {
+  const result = await dynamo.send(new GetCommand({
+    TableName: TENANTS_TABLE,
+    Key: { tenantId },
+  }));
+  if (!result.Item) return false;
+  return result.Item.authorizedNumbers?.includes(fromNumber) ?? false;
+}
+
+app.post('/sms', async (req, res) => {
+  const tenantId = req.body.To;
+  const userId = req.body.From;
+  const body = req.body.Body ?? '';
   const twiml = new MessagingResponse();
-  const response = body.toLowerCase();
+  const response = body.toLowerCase().trim();
+
+  const authorized = await isAuthorized(tenantId, userId);
+  if (!authorized) {
+    twiml.message("Sorry, your number is not authorized for this list.");
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    return res.end(twiml.toString());
+  }
+
   let command = '';
+  if (response.startsWith('add'))      command = 'add';
+  else if (response.startsWith('list')) command = 'list';
+  else if (response.startsWith('remove')) command = 'remove';
+  else if (response.startsWith('clear')) command = 'clear';
+  else if (response.startsWith('announce')) command = 'announce';
 
-  //parse the request sent in by the user and look for the first word then set the
-  //command varible that will used to determine the proper response later
-  if (response.substring(0, 3) == "add") {
-    command = 'add';
-  }
-  else if (response.substring(0, 4) == "list") {
-    command = 'list';
-  }
-  else if (response.substring(0, 6) == 'remove') {
-    command = 'remove';
-  }
-  else if (response.substring(0, 5) == 'clear') {
-    command = 'clear';
-  }
-  else if (response.substring(0, 8) == 'announce') {
-    command = 'announce';
-  }
-
-  //based upon the command sent by the user, the following will do certain
-  //actions ex: list out items on the todo list
   switch (command) {
-    case 'add':
-      fs.appendFile('list.txt', body.substring(4) + ',');
-      console.log('Saved!');
-      twiml.message("Added");
+    case 'add': {
+      const item = body.substring(4).trim();
+      if (!item) {
+        twiml.message("Please specify an item to add.");
+        break;
+      }
+      const items = await readList(tenantId);
+      items.push(item);
+      await writeList(tenantId, items, userId);
+      twiml.message(`Added: ${item}`);
       break;
-    case 'list':
-      //read todo list file and load it into varible as an array using the 
-      //readList function
-      var list = readList('./list.txt');
+    }
 
-      //if list is currently empty tell the user
-      if (list[0] == "undefined" || list[0] == '') {
-        twiml.message("List is currently empty");
-        fs.writeFileSync('list.txt', '');
+    case 'list': {
+      const items = await readList(tenantId);
+      if (items.length === 0) {
+        twiml.message("List is currently empty.");
       } else {
-        let finalList = '';
-
-        //iterate through list, add a row number to each item, and send it
-        //to the user
-        for (let i = 0; i < list.length - 1; i++) {
-          finalList = finalList + "\n" + (i + 1) + ". " + list[i];
-        }
-
-        twiml.message(/*{
-          ****************************
-          Currently disabled logging 
-          *****************************
-          action: 'http://ec2-35-171-203-74.compute-1.amazonaws.com:8080/status/',
-          method: 'POST'
-        }, */finalList);
-
-        //clear varibles that were used so they can be reused clean
-        list, finalList = '';
+        const formatted = items.map((item, i) => `${i + 1}. ${item}`).join('\n');
+        twiml.message(formatted);
       }
-
       break;
-    case 'remove':
-      let itemToBeRemoved = body.substring(7);
+    }
 
-      if (isNaN(itemToBeRemoved)) {
-        twiml.message("Please send number of item to be removed.");
+    case 'remove': {
+      const input = body.substring(7).trim();
+      const index = parseInt(input, 10);
+      if (isNaN(index)) {
+        twiml.message("Please send the number of the item to remove.");
+        break;
       }
-      else {
-        var newList = '';
-        //read todo list file and load it into varible as an array using the 
-        //readList function
-        list = readList('./list.txt');
-
-        if (itemToBeRemoved > list.length - 1 || itemToBeRemoved <= 0) {
-          twiml.message("Please enter a number from 1 to " + (list.length - 1));
-        }
-        else {
-          for (let i = 0; i < list.length - 1; i++) {
-            if (itemToBeRemoved != i + 1) {
-              newList = newList + list[i] + ",";
-            }
-          }
-          twiml.message("Removed");
-          fs.writeFileSync('list.txt', newList);
-        }
+      const items = await readList(tenantId);
+      if (index < 1 || index > items.length) {
+        twiml.message(`Please enter a number from 1 to ${items.length}.`);
+        break;
       }
-
-      console.log(newList);
-
-      //clear varibles that were used so they can be reused clean
-      list, newList = '';
+      const removed = items.splice(index - 1, 1)[0];
+      await writeList(tenantId, items, userId);
+      twiml.message(`Removed: ${removed}`);
       break;
-    case 'clear':
-      var newList = '';
-      //read todo list file and load it into varible as an array using the 
-      //readList function
-      list = readList('./list.txt');
-      newList = '';
-      twiml.message("List cleared");
-      fs.writeFileSync('list.txt', newList);
+    }
 
-      console.log('List cleared');
+    case 'clear': {
+      await writeList(tenantId, [], userId);
+      twiml.message("List cleared.");
+      break;
+    }
 
-      //clear varibles that were used so they can be reused clean
-      list, newList = '';
+    case 'announce': {
+      const announcement = body.substring(9).trim();
+      const client = require('twilio')(
+        process.env.apiKeySID,
+        process.env.apiKeySecret,
+        { accountSid: process.env.accountSID }
+      );
+      const targets = ['+15037812714', '+15035449035'];
+      await Promise.all(targets.map(to =>
+        client.messages.create({ from: tenantId, body: announcement, to })
+      ));
+      twiml.message(`Announced: ${announcement}`);
       break;
-    case 'announce':
-      const announcement = body.substring(9);
-      const accountSid = process.env.accountSID;
-      const authToken = process.env.authToken;
-      const client = require('twilio')(accountSid, authToken);
-      client.messages
-        .create({from: '+15034448534', body: announcement, to: '+15037812714'})
-        .then(console.log('Announment made: ' + announcement));
-      client.messages
-        .create({from: '+15034448534', body: announcement, to: '+15035449035'})
-        .then(console.log('Announment made: ' + announcement));
-      break;
+    }
+
     default:
-      twiml.message("Please respond with add {item}, remove {item}, list, or clear");
+      twiml.message("Commands: add {item}, remove {#}, list, clear, announce {message}");
       break;
   }
 
@@ -139,16 +133,13 @@ app.post('/sms/', (req, res) => {
   res.end(twiml.toString());
 });
 
-/* ***********************
-Currently status logging disabled
-app.post('/status/', (req, res) => {
-  console.log("Message Status: " + req.body.MessageStatus);
-});*/
+// Lambda handler
+const serverless = require('serverless-http');
+module.exports.handler = serverless(app);
 
-http.createServer(app).listen(8080, () => {
-  console.log('Express server listening on port 8080');
-});
-
-var readList = (listFile) => {
-  return fs.readFileSync(listFile, 'utf8').split(',');
-};
+// Local dev entrypoint
+if (require.main === module) {
+  http.createServer(app).listen(8080, () => {
+    console.log('Express server listening on port 8080');
+  });
+}
