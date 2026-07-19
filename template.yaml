@@ -22,9 +22,9 @@ Globals:
       Variables:
         TENANTS_TABLE: !Ref GroceryTenantsTable
         LISTS_TABLE: !Ref GroceryListsTable
-        accountSID: !Sub '{{resolve:ssm:/grocerylist/twilio/accountSID}}'
-        apiKeySID: !Sub '{{resolve:ssm:/grocerylist/twilio/apiKeySID}}'
-        apiKeySecret: !Sub '{{resolve:ssm:/grocerylist/twilio/apiKeySecret}}'
+        accountSID: '{{resolve:ssm-secure:/grocerylist/twilio/accountSID}}'
+        apiKeySID: '{{resolve:ssm-secure:/grocerylist/twilio/apiKeySID}}'
+        apiKeySecret: '{{resolve:ssm-secure:/grocerylist/twilio/apiKeySecret}}'
 
 Resources:
 
