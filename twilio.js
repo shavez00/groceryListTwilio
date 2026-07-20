@@ -85,15 +85,16 @@ app.post('/sms', async (req, res) => {
 
   switch (command) {
     case 'add': {
-      const item = body.substring(4).trim();
-      if (!item) {
+      const input = body.substring(4).trim();
+      if (!input) {
         twiml.message("Please specify an item to add.");
         break;
       }
+      const newItems = input.split(',').map(s => s.trim()).filter(s => s.length > 0);
       const items = await readList(tenantId);
-      items.push(item);
+      items.push(...newItems);
       await writeList(tenantId, items, userId);
-      twiml.message(`Added: ${item}`);
+      twiml.message(`Added: ${newItems.join(', ')}`);
       break;
     }
 
@@ -110,17 +111,27 @@ app.post('/sms', async (req, res) => {
 
     case 'remove': {
       const input = body.substring(7).trim();
-      const index = parseInt(input, 10);
-      if (isNaN(index)) {
-        twiml.message("Please send the number of the item to remove.");
-        break;
-      }
       const items = await readList(tenantId);
-      if (index < 1 || index > items.length) {
-        twiml.message(`Please enter a number from 1 to ${items.length}.`);
-        break;
+      const index = parseInt(input, 10);
+      let removed;
+
+      if (!isNaN(index)) {
+        if (index < 1 || index > items.length) {
+          twiml.message(`Please enter a number from 1 to ${items.length}.`);
+          break;
+        }
+        removed = items.splice(index - 1, 1)[0];
+      } else {
+        const matchIndex = items.findIndex(
+          item => item.toLowerCase() === input.toLowerCase()
+        );
+        if (matchIndex === -1) {
+          twiml.message(`"${input}" not found on the list.`);
+          break;
+        }
+        removed = items.splice(matchIndex, 1)[0];
       }
-      const removed = items.splice(index - 1, 1)[0];
+
       await writeList(tenantId, items, userId);
       twiml.message(`Removed: ${removed}`);
       break;
@@ -134,17 +145,25 @@ app.post('/sms', async (req, res) => {
 
     case 'announce': {
       const announcement = body.substring(9).trim();
+      const tenantRecord = await dynamo.send(new GetCommand({
+        TableName: TENANTS_TABLE,
+        Key: { tenantId },
+      }));
+      const targets = tenantRecord.Item?.authorizedNumbers ?? [];
+      if (targets.length === 0) {
+        twiml.message("No authorized numbers found to announce to.");
+        break;
+      }
       const secrets = await getTwilioSecrets();
       const client = require('twilio')(
         secrets.apiKeySID,
         secrets.apiKeySecret,
         { accountSid: secrets.accountSID }
       );
-      const targets = ['+15037812714', '+15035449035'];
       await Promise.all(targets.map(to =>
         client.messages.create({ from: tenantId, body: announcement, to })
       ));
-      twiml.message(`Announced: ${announcement}`);
+      twiml.message(`Announced to ${targets.length} number(s): ${announcement}`);
       break;
     }
 
