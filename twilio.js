@@ -112,28 +112,38 @@ app.post('/sms', async (req, res) => {
     case 'remove': {
       const input = body.substring(7).trim();
       const items = await readList(tenantId);
-      const index = parseInt(input, 10);
-      let removed;
+      const targets = input.split(',').map(s => s.trim()).filter(s => s.length > 0);
 
-      if (!isNaN(index)) {
-        if (index < 1 || index > items.length) {
-          twiml.message(`Please enter a number from 1 to ${items.length}.`);
-          break;
+      // Resolve each target to a 0-based index (by number or by name)
+      const indicesToRemove = [];
+      for (const target of targets) {
+        const num = parseInt(target, 10);
+        if (!isNaN(num)) {
+          if (num < 1 || num > items.length) {
+            twiml.message(`${num} is out of range. List has ${items.length} item(s).`);
+            indicesToRemove.length = 0;
+            break;
+          }
+          indicesToRemove.push(num - 1);
+        } else {
+          const idx = items.findIndex(item => item.toLowerCase() === target.toLowerCase());
+          if (idx === -1) {
+            twiml.message(`"${target}" not found on the list.`);
+            indicesToRemove.length = 0;
+            break;
+          }
+          indicesToRemove.push(idx);
         }
-        removed = items.splice(index - 1, 1)[0];
-      } else {
-        const matchIndex = items.findIndex(
-          item => item.toLowerCase() === input.toLowerCase()
-        );
-        if (matchIndex === -1) {
-          twiml.message(`"${input}" not found on the list.`);
-          break;
-        }
-        removed = items.splice(matchIndex, 1)[0];
       }
 
+      if (indicesToRemove.length === 0) break;
+
+      // Remove highest indices first so earlier indices stay valid
+      const uniqueSorted = [...new Set(indicesToRemove)].sort((a, b) => b - a);
+      const removed = uniqueSorted.map(i => items.splice(i, 1)[0]);
+
       await writeList(tenantId, items, userId);
-      twiml.message(`Removed: ${removed}`);
+      twiml.message(`Removed: ${removed.reverse().join(', ')}`);
       break;
     }
 
