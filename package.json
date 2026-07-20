@@ -5,7 +5,12 @@
   "main": "twilio.js",
   "scripts": {
     "start": "node twilio.js",
-    "dev": "node twilio.js"
+    "dev": "node twilio.js",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "supertest": "^7.0.0"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.600.0",

@@ -71,7 +71,7 @@ Items could be stored as objects with a `category` field (`{"name": "milk", "cat
 ### Read Receipts / Delivery Status
 The old code had a disabled status webhook (`/status/`). Re-enabling it would let you log whether the SMS reply was delivered successfully. Low value for a household app but easy to add back.
 
-### Web Interface
+### Web Interface *(not yet implemented)*
 A simple read-only web page at `grocerylist.vezcore.com` (separate from the `/sms` endpoint) that displays the current list. Could be a plain HTML file served from S3 + CloudFront, reading from DynamoDB via a Lambda-backed API GET endpoint.
 
 ### Shared Shopping Mode
@@ -81,6 +81,4 @@ A "checked off" state per item so family members can mark items as picked up whi
 
 ## Known Limitations
 
-- **Announce targets are hardcoded.** The phone numbers in the `announce` command (`+15037812714`, `+15035449035`) are hardcoded in `twilio.js`. These should be moved to the `GroceryTenants` table as an `announceNumbers` attribute and read at runtime.
-- **No error handling.** If DynamoDB is unavailable, the Lambda returns a 502 and Twilio retries. For a hobby app this is fine; for production, add try/catch and return a friendly TwiML error message.
-- **No input length validation.** A very long item name would be stored and potentially exceed the 1600-character SMS limit when listing. Not a practical issue for a grocery list.
+- **No Twilio webhook signature validation.** Twilio's `validateExpressRequest` helper would let us reject forged requests before any DynamoDB work. However, it requires the Twilio Auth Token — a master account credential that can send SMS from any number and read call logs. Storing it in SSM would widen the credential blast radius beyond what the current API Key approach allows. The existing `isAuthorized` check (DynamoDB lookup of the `From` number against `authorizedNumbers`) is a sufficient substitute at this scale: a forged request would need to know both the `To` Twilio number and a valid `From` number from the tenant's allow-list. This is an intentional trade-off, not an oversight.
