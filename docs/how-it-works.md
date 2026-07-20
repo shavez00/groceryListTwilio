@@ -32,40 +32,60 @@ All commands are case-insensitive. The first word determines the command.
 
 | Command | Example | What it does |
 |---------|---------|--------------|
-| `add {item}` | `add milk` | Appends the item to the grocery list |
+| `add {item}` | `add milk` | Appends one item to the grocery list |
+| `add {item}, {item}, ...` | `add milk, eggs, bread` | Appends multiple items in one message |
 | `list` | `list` | Returns the full list, numbered |
 | `remove {#}` | `remove 2` | Removes item number 2 from the list |
+| `remove {name}` | `remove eggs` | Removes the item matching that name (case-insensitive) |
+| `remove {#},{#},...` | `remove 2,3,4` | Removes multiple items by number in one message |
+| `remove {name},{name},...` | `remove eggs, bread` | Removes multiple items by name in one message |
 | `clear` | `clear` | Empties the entire list |
-| `announce {message}` | `announce dinner is ready` | Sends a broadcast SMS to all family members |
+| `announce {message}` | `announce dinner is ready` | Sends a broadcast SMS to all authorized numbers |
 | anything else | `hello` | Returns the help message |
 
 ### Example Conversation
 
 ```
-You:  add milk
-App:  Added: milk
-
-You:  add eggs
-App:  Added: eggs
-
-You:  add bread
-App:  Added: bread
+You:  add milk, eggs, bread
+App:  Added: milk, eggs, bread
 
 You:  list
 App:  1. milk
       2. eggs
       3. bread
 
-You:  remove 2
-App:  Removed: eggs
+You:  add butter, cheese
+App:  Added: butter, cheese
 
 You:  list
 App:  1. milk
-      2. bread
+      2. eggs
+      3. bread
+      4. butter
+      5. cheese
+
+You:  remove 2,3
+App:  Removed: eggs, bread
+
+You:  list
+App:  1. milk
+      2. butter
+      3. cheese
+
+You:  remove milk
+App:  Removed: milk
 
 You:  clear
 App:  List cleared.
 ```
+
+### Important: Each item is stored separately
+
+When you text `add milk, eggs, bread`, the app splits on commas and stores three separate items. This means:
+
+- `list` returns `1. milk  2. eggs  3. bread` — not `1. milk, eggs, bread`
+- `remove 2` removes `eggs`, not the whole string
+- Item names can contain spaces: `add almond milk` stores `almond milk` as one item
 
 ## Request Lifecycle (Step by Step)
 
@@ -95,3 +115,37 @@ See [Data Model](data-model.md) for the full schema.
 ## Authorization
 
 The app maintains an `authorizedNumbers` list per tenant in DynamoDB. Any number not on that list receives a rejection message and cannot read or modify the list. This prevents strangers who obtain the Twilio number from accessing a family's list.
+
+---
+
+## Troubleshooting
+
+### "The list shows one item like '1. milk, eggs, bread' instead of separate items"
+
+This happens when items were added before comma-splitting was supported, or by texting `add milk, eggs, bread` to an older version of the app. The entire string was stored as a single item.
+
+**Fix:** Clear the list and re-add items:
+```
+clear
+add milk, eggs, bread
+```
+
+Or clear it manually via the AWS CLI (see [Operations Guide](operations.md)).
+
+### "remove eggs says 'not found' but eggs is on the list"
+
+The name match is exact (case-insensitive). Check that the item was stored exactly as typed. Text `list` to see the exact spelling, then use `remove {exact name}` or `remove {#}` by number instead.
+
+### "Sorry, your number is not authorized for this list"
+
+Your phone number (`From`) is not in the `authorizedNumbers` list for this Twilio number (`To`). Contact whoever manages the app to have your number added. See [Operations Guide](operations.md) for how to add an authorized number.
+
+### "remove 2 is out of range"
+
+The list has fewer items than the number you sent. Text `list` first to see the current items and their numbers.
+
+### No reply at all
+
+1. Check that the Twilio webhook URL is set to `https://grocerylist.vezcore.com/sms` with method `POST`
+2. Check the Lambda logs: `aws logs tail /aws/lambda/grocery-list-twilio --follow --region us-west-2`
+3. Check the GitHub Actions deploy history to confirm the latest code is deployed

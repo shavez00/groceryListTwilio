@@ -86,6 +86,9 @@ Three thin wrappers around DynamoDB:
 - **`writeList`** — overwrites the entire list with a new `items` array. Also records `updatedAt` and `lastModifiedBy`.
 - **`isAuthorized`** — fetches the tenant record and checks if `fromNumber` is in `authorizedNumbers`. Returns `false` if the tenant doesn't exist at all.
 
+> **Why `writeList` overwrites the whole array instead of using a DynamoDB update expression:**
+> At grocery list scale (dozens of items), reading the full array, modifying it in JavaScript, and writing it back is simpler and just as fast as a DynamoDB update expression. It also makes the remove-by-index and remove-by-name logic straightforward native array operations.
+
 ### 5. Express Route Handler
 
 ```js
@@ -105,6 +108,12 @@ This is the single HTTP endpoint. All SMS commands flow through here.
 3. Parse the first word of `Body` to determine the command
 4. Execute the command (read/write DynamoDB as needed)
 5. Return a TwiML XML response that Twilio converts to an SMS
+
+**Command-specific notes:**
+
+- **`add`** — splits the input on commas (`"milk, eggs, bread"` → `["milk", "eggs", "bread"]`) and pushes all items onto the array in one write.
+- **`remove`** — splits on commas to support multi-remove (`"2,3,4"` or `"eggs, bread"`). Each target is resolved to a 0-based array index — either by parsing it as a number, or by case-insensitive name match. Indices are then sorted highest-to-lowest before splicing so that removing index 4 doesn't shift index 2's position before it is removed. Duplicate indices are deduplicated with `Set`.
+- **`announce`** — reads `authorizedNumbers` from the `GroceryTenants` table at runtime and sends the broadcast to all of them. This means adding a new family member to `authorizedNumbers` automatically includes them in future announcements — no code change needed.
 
 ### 6. Dual-Mode Entry Point
 
