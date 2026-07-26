@@ -4,157 +4,156 @@
 
 ```
 groceryListTwilio/
-├── twilio.js                        # The entire application (one file)
-├── package.json                     # Node.js dependencies and scripts
-├── package-lock.json                # Locked dependency versions (committed)
-├── template.yaml                    # AWS SAM / CloudFormation infrastructure definition
-├── .gitignore                       # Files excluded from git
+├── twilio.js                        # Entry point: Express app, route mounts, Lambda export
+├── package.json
+├── package-lock.json                # Locked deps (committed — required for npm ci)
+├── template.yaml                    # AWS SAM / CloudFormation infrastructure
+├── backfill-mcp-key-hash.sh         # One-time script: populate mcpApiKeyHash on existing tenants
 ├── .github/
 │   └── workflows/
-│       └── deploy.yml               # GitHub Actions CI/CD pipeline
-└── docs/                            # This documentation
-    ├── README.md
-    ├── how-it-works.md
-    ├── architecture.md
-    ├── data-model.md
-    ├── codebase.md                  # (this file)
-    ├── cicd.md
-    ├── deployment.md
-    ├── operations.md
-    ├── standards.md
-    └── roadmap.md
+│       └── deploy.yml               # GitHub Actions CI/CD
+├── routes/
+│   ├── sms.js                       # SMS command handler (TwiML responses)
+│   └── oauth.js                     # OAuth 2.0 endpoints (for ChatGPT connection)
+├── src/
+│   ├── repository.js                # All DynamoDB operations
+│   ├── service.js                   # Business logic (shared by SMS and MCP)
+│   └── mcp.js                       # MCP server: 5 tools + bearer auth
+├── test/
+│   ├── service.test.js              # Unit tests for service layer
+│   └── mcp.test.js                  # Integration tests for MCP HTTP endpoint
+├── twilio.test.js                   # Integration tests for SMS endpoint
+└── docs/
 ```
 
-## twilio.js — Annotated Walkthrough
+---
 
-The entire application lives in a single file. Here is what each section does.
+## twilio.js — Entry Point
 
-### 1. Imports
+Thin file. Sets up Express, mounts routers, exports the Lambda handler.
 
 ```js
-const http = require('http');
-const express = require('express');
-const MessagingResponse = require('twilio').twiml.MessagingResponse;
-const bodyParser = require('body-parser');
-const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, GetCommand, PutCommand } = require('@aws-sdk/lib-dynamodb');
-const { SSMClient, GetParametersCommand } = require('@aws-sdk/client-ssm');
+app.use(oauthRouter);           // /.well-known/*, /oauth/*
+app.use('/mcp', mcpRouter);     // MCP server
+app.use('/sms', smsRouter);     // SMS webhook
 ```
 
-- `express` — minimal web framework that handles the HTTP routing
-- `twilio` — official Twilio SDK, used here only for building TwiML XML responses and sending outbound SMS
-- `body-parser` — parses the URL-encoded form body that Twilio sends in its webhook POST
-- `@aws-sdk/client-dynamodb` + `@aws-sdk/lib-dynamodb` — AWS SDK for DynamoDB. `lib-dynamodb` is the Document Client, which automatically marshals/unmarshals JavaScript types to DynamoDB's internal format (e.g. converts `["milk", "eggs"]` to `{"L": [{"S": "milk"}, {"S": "eggs"}]}`)
-- `@aws-sdk/client-ssm` — AWS SDK for reading encrypted credentials from SSM Parameter Store
+Also owns the SSM secrets cache for Twilio credentials (Account SID, API Key SID, API Key Secret). Shares the cache with `routes/sms.js` via `smsRouter.setSecretsProvider(getTwilioSecrets)`.
 
-### 2. DynamoDB and SSM Client Initialization
+The dual-mode entry point pattern is preserved: `module.exports.handler = serverless(app)` for Lambda, and `if (require.main === module) http.createServer(app).listen(8080)` for local dev.
 
-```js
-const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-const ssm = new SSMClient({});
-const TENANTS_TABLE = process.env.TENANTS_TABLE || 'GroceryTenants';
-const LISTS_TABLE = process.env.LISTS_TABLE || 'GroceryLists';
-```
+---
 
-These are initialized once when the Lambda container starts (the "cold start"). Each subsequent invocation reuses these clients. The table names come from environment variables injected by CloudFormation — this lets the same code work across different deployments without hardcoding names.
+## src/repository.js — DynamoDB Operations
 
-### 3. Secrets Caching
+All DynamoDB reads and writes. No business logic.
 
-```js
-let twilioSecrets = null;
-async function getTwilioSecrets() {
-  if (twilioSecrets) return twilioSecrets;
-  // ... fetch from SSM and cache ...
-}
-```
+| Function | What it does |
+|----------|-------------|
+| `readList(tenantId, listId)` | Returns `{ items, version, updatedAt, lastModifiedBy }`. Empty items array if list doesn't exist. |
+| `writeList(tenantId, listId, items, expectedVersion, modifiedBy)` | Conditional PutCommand — throws `ConditionalCheckFailedException` if version doesn't match. Increments version. |
+| `writeListUnconditional(tenantId, listId, items, modifiedBy)` | Reads current version then writes without a condition check. Used by the SMS path. |
+| `isAuthorized(tenantId, fromNumber)` | Checks `authorizedNumbers` list in `GroceryTenants`. Returns boolean. |
+| `getTenant(tenantId)` | Returns the full tenant record. |
+| `getTenantByApiKeyHash(hash)` | Queries `mcpApiKeyHash-index` GSI. Returns tenant or null. Used for bearer token auth. |
 
-Twilio credentials (Account SID, API Key SID, API Key Secret) are stored encrypted in SSM Parameter Store. This function fetches all three in a single SSM API call and caches the result in the `twilioSecrets` variable. Because Lambda containers are reused across warm invocations, this means SSM is only called once per container lifetime — reducing latency and SSM API costs.
+**Lazy version migration:** Items added before the `version` field existed have no `version` attribute in DynamoDB. `readList` treats a missing `version` as `0`. The first conditional write uses `attribute_not_exists(#v) OR #v = :expected`, so version `0` items get a `version: 1` on first write — no batch migration needed.
 
-The `if (twilioSecrets) return twilioSecrets;` guard is the cache check. On the first invocation (cold start) it's `null` and SSM is called. On all subsequent warm invocations it returns immediately.
+---
 
-### 4. DynamoDB Helper Functions
+## src/service.js — Business Logic
 
-```js
-async function readList(tenantId, listId = DEFAULT_LIST) { ... }
-async function writeList(tenantId, items, modifiedBy, listId = DEFAULT_LIST) { ... }
-async function isAuthorized(tenantId, fromNumber) { ... }
-```
+Pure functions. No Express, no TwiML, no MCP. Both `routes/sms.js` and `src/mcp.js` call this.
 
-Three thin wrappers around DynamoDB:
+| Function | Behavior |
+|----------|----------|
+| `getList(tenantId, listId)` | Returns `{ items: [{position, value}], version, updatedAt, lastModifiedBy }` |
+| `addItems(tenantId, listId, items, modifiedBy)` | Validates, deduplicates (case-insensitive), retries up to 3× on version conflict. Returns `{ addedItems, skippedItems, resultCount, version }` |
+| `removeItems(tenantId, listId, selectors, expectedVersion, modifiedBy)` | Throws `VERSION_CONFLICT` if version changed. Returns `{ removedItems, notFoundItems, conflictItems, resultCount, version }` |
+| `clearList(tenantId, listId, expectedVersion, modifiedBy)` | `expectedVersion` optional — omit for unconditional clear. Returns `{ clearedCount, resultCount, version, listId }` |
+| `replaceList(tenantId, listId, items, expectedVersion, modifiedBy)` | Validates items (max 50), conditional write. Returns `{ previousCount, newCount, version, listId }` |
 
-- **`readList`** — fetches the `items` array for a given tenant and list. Returns an empty array if no list exists yet (first use).
-- **`writeList`** — overwrites the entire list with a new `items` array. Also records `updatedAt` and `lastModifiedBy`.
-- **`isAuthorized`** — fetches the tenant record and checks if `fromNumber` is in `authorizedNumbers`. Returns `false` if the tenant doesn't exist at all.
+**Validation limits:**
+- Max 100 chars per item
+- Max 20 items per `add` request
+- Max 50 items per `replace` request
+- Max 50 items total on list
 
-> **Why `writeList` overwrites the whole array instead of using a DynamoDB update expression:**
-> At grocery list scale (dozens of items), reading the full array, modifying it in JavaScript, and writing it back is simpler and just as fast as a DynamoDB update expression. It also makes the remove-by-index and remove-by-name logic straightforward native array operations.
+---
 
-### 5. Express Route Handler
+## src/mcp.js — MCP Server
 
-```js
-app.post('/sms', async (req, res) => {
-  const tenantId = req.body.To;
-  const userId = req.body.From;
-  const body = req.body.Body ?? '';
-  ...
-});
-```
+Exports an Express `Router` mounted at `/mcp` in `twilio.js`.
 
-This is the single HTTP endpoint. All SMS commands flow through here.
+**Auth middleware** runs on every request before the MCP transport sees it:
+1. Extracts bearer token from `Authorization` header
+2. SHA-256 hashes it
+3. Queries `mcpApiKeyHash-index` GSI via `repository.getTenantByApiKeyHash(hash)`
+4. Injects `req.mcpTenant` on success; returns 401 with `WWW-Authenticate` header on failure
 
-**Flow:**
-1. Extract `To`, `From`, `Body` from the Twilio POST body
-2. Check authorization — reject immediately if not authorized
-3. Parse the first word of `Body` to determine the command
-4. Execute the command (read/write DynamoDB as needed)
-5. Return a TwiML XML response that Twilio converts to an SMS
+**Transport:** `WebStandardStreamableHTTPServerTransport` in stateless mode (`sessionIdGenerator: undefined`). A new instance is created per request. `buildWebRequest()` manually constructs a Web Standard `Request` from Express's `req.headers` — this is required because `serverless-http` doesn't populate `rawHeaders`, which the Node.js transport's Hono bridge needs.
 
-**Command-specific notes:**
+**5 MCP tools registered:**
 
-- **`add`** — splits the input on commas (`"milk, eggs, bread"` → `["milk", "eggs", "bread"]`) and pushes all items onto the array in one write.
-- **`remove`** — splits on commas to support multi-remove (`"2,3,4"` or `"eggs, bread"`). Each target is resolved to a 0-based array index — either by parsing it as a number, or by case-insensitive name match. Indices are then sorted highest-to-lowest before splicing so that removing index 4 doesn't shift index 2's position before it is removed. Duplicate indices are deduplicated with `Set`.
-- **`announce`** — reads `authorizedNumbers` from the `GroceryTenants` table at runtime and sends the broadcast to all of them. This means adding a new family member to `authorizedNumbers` automatically includes them in future announcements — no code change needed.
+| Tool | Annotations | Notes |
+|------|-------------|-------|
+| `get_grocery_list` | readOnly, idempotent | Call first to get current version before any write |
+| `add_grocery_items` | idempotent | Duplicate items skipped — safe to retry |
+| `remove_grocery_items` | destructive | Requires `expectedVersion` from prior `get_grocery_list` |
+| `clear_grocery_list` | destructive, idempotent | `expectedVersion` optional |
+| `replace_grocery_list` | destructive | Requires `expectedVersion` |
 
-### 6. Dual-Mode Entry Point
+The `tenantId` is sourced from `authInfo.extra.tenantId` (set by the auth middleware). Tools never accept `tenantId` as an argument.
 
-```js
-// Lambda handler
-const serverless = require('serverless-http');
-module.exports.handler = serverless(app);
+---
 
-// Local dev entrypoint
-if (require.main === module) {
-  http.createServer(app).listen(8080, () => {
-    console.log('Express server listening on port 8080');
-  });
-}
-```
+## routes/sms.js — SMS Handler
 
-`serverless-http` wraps the Express app so Lambda can invoke it — Lambda passes an event object, `serverless-http` translates it into a fake HTTP request Express understands, then translates Express's response back into a Lambda response object.
+Handles `POST /sms`. Validates the Twilio `From`/`To` fields, parses the SMS command, calls `src/service.js`, and returns TwiML XML.
 
-`if (require.main === module)` is true only when you run the file directly with `node twilio.js`. It is `false` when Lambda imports it as a module (via `require('twilio')`). This means the same file runs locally as a plain HTTP server and in production as a Lambda function with no code changes.
+Uses `repository.js` directly for the `announce` command (needs the full tenant record to broadcast to `authorizedNumbers`). All list operations go through `service.js`.
 
-## Dependencies (package.json)
+Exports `setSecretsProvider(fn)` so `twilio.js` can inject the SSM cache without creating a circular dependency.
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `@aws-sdk/client-dynamodb` | ^3.600.0 | Base DynamoDB client |
-| `@aws-sdk/client-ssm` | ^3.600.0 | SSM Parameter Store client |
-| `@aws-sdk/lib-dynamodb` | ^3.600.0 | Document Client — auto-marshals JS types |
-| `body-parser` | ^1.20.3 | Parses URL-encoded form bodies |
-| `express` | ^4.19.2 | HTTP routing |
-| `serverless-http` | ^3.2.0 | Wraps Express for Lambda |
-| `twilio` | ^5.3.0 | TwiML builder + outbound SMS |
+---
 
-## template.yaml — SAM Infrastructure
+## routes/oauth.js — OAuth Endpoints
 
-The `template.yaml` file defines every AWS resource the app needs. SAM (Serverless Application Model) is a CloudFormation extension that adds shorthand types like `AWS::Serverless::Function` that expand into multiple CloudFormation resources during deployment.
+Implements a minimal OAuth 2.0 authorization server so ChatGPT's MCP connector can authenticate.
 
-**Key sections:**
+| Route | Purpose |
+|-------|---------|
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata — ChatGPT fetches this to discover the token endpoint |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata — points clients at the auth server |
+| `GET /oauth/authorize` | Renders an API key entry form |
+| `POST /oauth/authorize` | Validates the key, redirects to ChatGPT callback with `code=<apiKey>` |
+| `POST /oauth/token` | Exchanges code or client_secret for access_token (the key itself, validated via GSI) |
 
-- **`Parameters`** — values passed in at deploy time (domain name, hosted zone ID, ACM cert ARN). These are supplied via GitHub Secrets in CI/CD.
-- **`Globals`** — default settings applied to all Lambda functions (runtime, timeout, memory, environment variables).
-- **`Resources`** — every AWS resource: Lambda, API Gateway, custom domain, Route 53 record, two DynamoDB tables.
-- **`Outputs`** — values printed after a successful deploy (the live endpoint URLs, Lambda ARN).
+The `mcpApiKey` UUID is used directly as both the authorization code and the access token. Since it's a 122-bit secret and is re-validated at every step via the GSI hash lookup, no server-side session state is needed — which is ideal for Lambda.
 
-Any infrastructure change — new environment variable, different timeout, new IAM permission — is made by editing `template.yaml`. Never change infrastructure through the AWS console; those changes will be overwritten on the next deploy.
+---
+
+## Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `@aws-sdk/client-dynamodb` + `lib-dynamodb` | DynamoDB Document Client |
+| `@aws-sdk/client-ssm` | SSM Parameter Store (Twilio creds) |
+| `@modelcontextprotocol/sdk` `1.29.0` (exact) | MCP server + WebStandard transport |
+| `body-parser` | URL-encoded form body parsing (SMS) |
+| `express` | HTTP routing |
+| `serverless-http` | Wraps Express for Lambda |
+| `twilio` | TwiML builder + outbound SMS (announce) |
+| `zod` | MCP tool input schema validation |
+
+---
+
+## Tests
+
+| File | What it covers |
+|------|---------------|
+| `twilio.test.js` | SMS endpoint: auth, all commands, DynamoDB errors, announce |
+| `test/service.test.js` | Service layer: all functions, edge cases, version conflict/retry |
+| `test/mcp.test.js` | MCP HTTP endpoint: auth, all 5 tools, version conflicts, tenant isolation |
+
+Run: `npm test` (67 tests, Jest + supertest)

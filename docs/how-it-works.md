@@ -2,7 +2,16 @@
 
 ## Overview
 
-A family member texts a Twilio phone number with a simple command like `add milk`. Twilio receives the SMS and immediately forwards it as an HTTP POST to this application running on AWS Lambda. The app processes the command, updates DynamoDB, and responds with a TwiML XML message that Twilio converts back into an SMS reply.
+Family members can manage a shared grocery list in two ways:
+
+1. **SMS** — text a Twilio phone number with commands like `add milk`
+2. **ChatGPT (MCP)** — ask ChatGPT to add, remove, or replace items using natural language
+
+Both channels read and write the same DynamoDB record. A change made via SMS is immediately visible to ChatGPT, and vice versa.
+
+---
+
+## SMS Channel
 
 ```
 Family member's phone
@@ -13,37 +22,35 @@ Family member's phone
         │
         │  HTTP POST to grocerylist.vezcore.com/sms
         ▼
-  AWS Lambda (twilio.js)
+  AWS Lambda (routes/sms.js)
         │
         ├─► DynamoDB (read/write list)
         │
-        │  TwiML XML response: "Added: milk"
+        │  TwiML XML: "Added: milk"
         ▼
-  Twilio (SMS carrier)
-        │
-        │  SMS reply: "Added: milk"
+  Twilio → SMS reply: "Added: milk"
         ▼
 Family member's phone
 ```
 
-## SMS Commands
+### SMS Commands
 
-All commands are case-insensitive. The first word determines the command.
+All commands are case-insensitive.
 
 | Command | Example | What it does |
 |---------|---------|--------------|
-| `add {item}` | `add milk` | Appends one item to the grocery list |
-| `add {item}, {item}, ...` | `add milk, eggs, bread` | Appends multiple items in one message |
-| `list` | `list` | Returns the full list, numbered |
-| `remove {#}` | `remove 2` | Removes item number 2 from the list |
-| `remove {name}` | `remove eggs` | Removes the item matching that name (case-insensitive) |
-| `remove {#},{#},...` | `remove 2,3,4` | Removes multiple items by number in one message |
-| `remove {name},{name},...` | `remove eggs, bread` | Removes multiple items by name in one message |
+| `add {item}` | `add milk` | Adds one item |
+| `add {item}, {item}, ...` | `add milk, eggs, bread` | Adds multiple items |
+| `list` | `list` | Returns the full numbered list |
+| `remove {#}` | `remove 2` | Removes item by number |
+| `remove {name}` | `remove eggs` | Removes item by name (case-insensitive) |
+| `remove {#},{#},...` | `remove 2,3,4` | Removes multiple items by number |
+| `remove {name},{name},...` | `remove eggs, bread` | Removes multiple items by name |
 | `clear` | `clear` | Empties the entire list |
-| `announce {message}` | `announce dinner is ready` | Sends a broadcast SMS to all authorized numbers |
+| `announce {message}` | `announce dinner is ready` | Broadcasts SMS to all authorized numbers |
 | anything else | `hello` | Returns the help message |
 
-### Example Conversation
+### Example SMS Conversation
 
 ```
 You:  add milk, eggs, bread
@@ -54,98 +61,100 @@ App:  1. milk
       2. eggs
       3. bread
 
-You:  add butter, cheese
-App:  Added: butter, cheese
+You:  remove 2
+App:  Removed: eggs
 
-You:  list
-App:  1. milk
-      2. eggs
-      3. bread
-      4. butter
-      5. cheese
-
-You:  remove 2,3
-App:  Removed: eggs, bread
-
-You:  list
-App:  1. milk
-      2. butter
-      3. cheese
-
-You:  remove milk
-App:  Removed: milk
+You:  remove bread
+App:  Removed: bread
 
 You:  clear
 App:  List cleared.
 ```
 
-### Important: Each item is stored separately
+---
 
-When you text `add milk, eggs, bread`, the app splits on commas and stores three separate items. This means:
+## ChatGPT (MCP) Channel
 
-- `list` returns `1. milk  2. eggs  3. bread` — not `1. milk, eggs, bread`
-- `remove 2` removes `eggs`, not the whole string
-- Item names can contain spaces: `add almond milk` stores `almond milk` as one item
+ChatGPT connects to the app via the MCP (Model Context Protocol) endpoint at `https://grocerylist.vezcore.com/mcp`. Once connected, ChatGPT has 5 tools it can call on your behalf based on natural language instructions.
 
-## Request Lifecycle (Step by Step)
+```
+You in ChatGPT: "Plan five dinners and add the ingredients to my grocery list"
+        │
+        ▼
+  ChatGPT reasons through meal plan, consolidates ingredients
+        │
+        │  Calls MCP tool: add_grocery_items(["chicken thighs", "garlic", ...])
+        ▼
+  grocerylist.vezcore.com/mcp
+        │
+        ├─► Bearer token validated against DynamoDB
+        ├─► Items written to GroceryLists
+        │
+        │  Returns: { addedItems: [...], resultCount: 12 }
+        ▼
+  ChatGPT: "I've added 12 ingredients to your grocery list."
+        │
+        ▼
+You text "list" via SMS → same 12 items appear
+```
 
-1. **SMS sent** — A family member texts the Twilio number (e.g. `+15034448534`).
+### MCP Tools
 
-2. **Twilio webhook** — Twilio makes an HTTP POST to `https://grocerylist.vezcore.com/sms` with a form-encoded body containing at minimum:
-   - `To` — the Twilio number that received the message (used as the tenant identifier)
-   - `From` — the sender's phone number
-   - `Body` — the text of the message
+| Tool | What to say to ChatGPT | What it does |
+|------|------------------------|--------------|
+| `get_grocery_list` | "What's on my grocery list?" | Returns current items and version |
+| `add_grocery_items` | "Add milk, eggs, and butter" | Adds items (skips duplicates) |
+| `remove_grocery_items` | "Remove milk from my list" | Removes items by name or position |
+| `clear_grocery_list` | "Clear my grocery list" | Removes all items (asks confirmation) |
+| `replace_grocery_list` | "Replace my list with these ingredients: ..." | Atomically replaces entire list |
 
-3. **API Gateway** — The request arrives at AWS API Gateway, which routes it to the Lambda function.
+You don't need to format anything — ChatGPT translates natural language into the correct tool calls automatically.
 
-4. **Authorization check** — The Lambda looks up `To` in the `GroceryTenants` DynamoDB table and checks that `From` is in the `authorizedNumbers` list. If not, it returns "not authorized" immediately.
+### Concurrency Safety
 
-5. **Command parsing** — The first word of `Body` determines the command (`add`, `list`, `remove`, `clear`, `announce`).
+Both channels use **optimistic locking** (`version` field on each list). If SMS and ChatGPT write at the same moment, one will retry automatically. A version conflict on a destructive operation (remove, clear, replace) is surfaced to ChatGPT as an error with a message to re-read and retry.
 
-6. **DynamoDB read/write** — The appropriate list operation runs against the `GroceryLists` table, keyed on `tenantId` (the `To` number) and `listId` (defaults to `"grocery"`).
+---
 
-7. **TwiML response** — The Lambda returns an XML response in Twilio's TwiML format. Twilio reads this and sends the text back to the family member.
+## Authentication
+
+### SMS
+The `From` phone number on every incoming SMS is checked against `authorizedNumbers` in DynamoDB. Numbers not on the list are rejected before any list operation runs.
+
+### MCP / ChatGPT
+Every MCP request includes `Authorization: Bearer <mcpApiKey>`. The server SHA-256 hashes the token and queries the `mcpApiKeyHash-index` GSI to resolve the tenant. Invalid tokens receive a 401. The `mcpApiKey` UUID is specific to your tenant — it never appears in logs.
+
+### OAuth (for ChatGPT connection setup)
+ChatGPT uses an OAuth 2.0 authorization code flow to establish the connection. When you first connect, ChatGPT redirects you to `https://grocerylist.vezcore.com/oauth/authorize` where you enter your `mcpApiKey`. The server validates it, redirects back to ChatGPT, and ChatGPT exchanges the code for a bearer token at `/oauth/token`. After setup, ChatGPT sends the bearer token automatically on every request.
+
+---
 
 ## Multi-Tenancy
 
-Each family has their own Twilio phone number. The `To` field on every incoming webhook identifies which family is texting, so a single deployed instance of this app can serve multiple families with completely isolated lists. There is no cross-tenant data access possible at the application level.
-
-See [Data Model](data-model.md) for the full schema.
-
-## Authorization
-
-The app maintains an `authorizedNumbers` list per tenant in DynamoDB. Any number not on that list receives a rejection message and cannot read or modify the list. This prevents strangers who obtain the Twilio number from accessing a family's list.
+Each family has their own Twilio phone number. The `To` field on every SMS (and the resolved `tenantId` from the bearer token for MCP) scopes all reads and writes to that family's data. Multiple families can use the same deployed instance with completely isolated lists.
 
 ---
 
 ## Troubleshooting
 
-### "The list shows one item like '1. milk, eggs, bread' instead of separate items"
+### SMS: "The list shows '1. milk, eggs, bread' instead of separate items"
+Items were added before comma-splitting was supported. Fix: `clear`, then re-add items.
 
-This happens when items were added before comma-splitting was supported, or by texting `add milk, eggs, bread` to an older version of the app. The entire string was stored as a single item.
+### SMS: "remove eggs says 'not found' but eggs is on the list"
+The name match is exact (case-insensitive). Text `list` to see exact spellings, then use the exact name or item number.
 
-**Fix:** Clear the list and re-add items:
-```
-clear
-add milk, eggs, bread
-```
+### SMS: "Sorry, your number is not authorized"
+Your `From` number is not in `authorizedNumbers`. See [Operations Guide](operations.md) to add it.
 
-Or clear it manually via the AWS CLI (see [Operations Guide](operations.md)).
+### MCP: ChatGPT shows "connection failed" or tools don't appear
+1. Verify the connector is configured with Server URL `https://grocerylist.vezcore.com/mcp`
+2. Verify the OAuth sign-in completed (there should be a connected indicator in ChatGPT)
+3. Check Lambda logs: `aws logs tail /aws/lambda/grocery-list-twilio --follow --region us-west-2`
 
-### "remove eggs says 'not found' but eggs is on the list"
+### MCP: "version conflict" error from ChatGPT
+The list changed between when ChatGPT read it and when it tried to write. ChatGPT will automatically re-read the list and retry.
 
-The name match is exact (case-insensitive). Check that the item was stored exactly as typed. Text `list` to see the exact spelling, then use `remove {exact name}` or `remove {#}` by number instead.
-
-### "Sorry, your number is not authorized for this list"
-
-Your phone number (`From`) is not in the `authorizedNumbers` list for this Twilio number (`To`). Contact whoever manages the app to have your number added. See [Operations Guide](operations.md) for how to add an authorized number.
-
-### "remove 2 is out of range"
-
-The list has fewer items than the number you sent. Text `list` first to see the current items and their numbers.
-
-### No reply at all
-
-1. Check that the Twilio webhook URL is set to `https://grocerylist.vezcore.com/sms` with method `POST`
-2. Check the Lambda logs: `aws logs tail /aws/lambda/grocery-list-twilio --follow --region us-west-2`
-3. Check the GitHub Actions deploy history to confirm the latest code is deployed
+### No reply at all (SMS)
+1. Check the Twilio webhook is set to `https://grocerylist.vezcore.com/sms` with method `POST`
+2. Check Lambda logs: `aws logs tail /aws/lambda/grocery-list-twilio --follow --region us-west-2`
+3. Check GitHub Actions for a failed deploy: `gh run list --repo shavez00/groceryListTwilio --limit 3`

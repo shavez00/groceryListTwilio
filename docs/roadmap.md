@@ -1,84 +1,62 @@
-# Future Roadmap
+# Roadmap
 
-## MCP Server Integration (Primary Next Feature)
+## Completed
 
-The application is designed to support an MCP (Model Context Protocol) server that allows AI assistants like ChatGPT or Claude to read and write grocery lists directly. This was a primary motivation for the DynamoDB migration and multi-tenant architecture.
+### MCP Server Integration ✓
 
-### What MCP Is
+ChatGPT can now read and write the grocery list directly via the MCP (Model Context Protocol) endpoint at `https://grocerylist.vezcore.com/mcp`.
 
-MCP is a standard protocol for giving AI assistants access to external tools and data. An MCP server exposes "tools" — functions the AI can call. In this context, the AI would have tools like `add_grocery_item`, `get_grocery_list`, and `clear_grocery_list`.
+**What was built:**
+- 5 MCP tools: `get_grocery_list`, `add_grocery_items`, `remove_grocery_items`, `clear_grocery_list`, `replace_grocery_list`
+- Bearer token authentication via SHA-256 hashed `mcpApiKey` and DynamoDB GSI lookup
+- OAuth 2.0 authorization code flow so ChatGPT's connector can authenticate
+- Optimistic locking (`version` field) for safe concurrent writes between SMS and ChatGPT
+- Shared service layer (`src/service.js`) used by both SMS and MCP channels
+- 67 automated tests
 
-### How It Would Work
-
-```
-User in ChatGPT: "Add the ingredients for chicken marsala to my grocery list"
-         │
-         ▼
-ChatGPT (with MCP configured)
-         │
-         │  Calls MCP tool: add_grocery_items(
-         │    tenantId: "+15034448534",
-         │    mcpApiKey: "a3f8c2d1-...",
-         │    items: ["chicken breast", "mushrooms", "marsala wine", "butter", "flour"]
-         │  )
-         ▼
-MCP Server (new Lambda function or extension of existing one)
-         │
-         │  Validates mcpApiKey against GroceryTenants table
-         │  Writes items to GroceryLists table
-         ▼
-DynamoDB GroceryLists updated
-         │
-         ▼
-Family member texts "list" → sees the new items
-```
-
-### Implementation Approach
-
-**Option A — Extend the existing Lambda:**
-Add new Express routes (e.g. `POST /mcp/tools/add_items`) to `twilio.js`. The MCP server would call these HTTP endpoints. Simple, no new infrastructure.
-
-**Option B — Dedicated MCP Lambda:**
-A second Lambda function with its own SAM resource, implementing the MCP protocol natively. More complex but cleanly separated from the SMS path.
-
-Option A is recommended for this project's scale and complexity.
-
-### Authentication
-
-The `mcpApiKey` UUID already stored in `GroceryTenants` is designed for this. The MCP server call includes the `tenantId` and `mcpApiKey`. The Lambda validates the key before any read or write.
-
-**Never use the same API key for MCP as for SMS.** SMS uses the Twilio `To`/`From` fields for identity. MCP uses the `mcpApiKey`. They are intentionally separate.
-
-### Data Already Ready
-
-The `GroceryLists` table already has a `lastModifiedBy` field. When MCP writes to the list, it will be set to `"mcp-server"`. When a family member texts, it is set to their phone number. This gives you a full audit trail of who (or what) changed the list.
+**Primary use case:** "Plan five dinners and add the missing ingredients to my grocery list" — ChatGPT reasons through a meal plan, consolidates the ingredients, and calls `add_grocery_items` or `replace_grocery_list` in one shot.
 
 ---
 
-## Other Potential Enhancements
+## Potential Future Enhancements
 
-### Multiple Named Lists
-The `listId` sort key in `GroceryLists` already supports this. The SMS path currently defaults to `"grocery"`, but you could extend the commands to support:
+### Multiple Named Lists via SMS
+
+The schema already supports multiple lists via the `listId` sort key on `GroceryLists`. The SMS path currently hardcodes `listId = "grocery"`. Extending commands to address other lists:
+
 ```
-add costco: paper towels   →  listId = "costco"
-list costco                →  reads the "costco" list
+add costco: paper towels, detergent
+list costco
+clear costco
 ```
-No schema changes needed — just command parsing logic in `twilio.js`.
 
-### Item Categories / Aisle Sorting
-Items could be stored as objects with a `category` field (`{"name": "milk", "category": "dairy"}`). The `list` command could group by category. This would require a schema change in `GroceryLists.items` from `List<String>` to `List<Map>`.
+No schema or infrastructure changes needed — just command parsing in `routes/sms.js`.
 
-### Read Receipts / Delivery Status
-The old code had a disabled status webhook (`/status/`). Re-enabling it would let you log whether the SMS reply was delivered successfully. Low value for a household app but easy to add back.
+### Twilio Webhook Signature Validation
 
-### Web Interface *(not yet implemented)*
-A simple read-only web page at `grocerylist.vezcore.com` (separate from the `/sms` endpoint) that displays the current list. Could be a plain HTML file served from S3 + CloudFront, reading from DynamoDB via a Lambda-backed API GET endpoint.
+Twilio's `validateExpressRequest` helper rejects forged webhooks by validating an HMAC-SHA1 signature on the request. Currently deferred because it requires the Twilio Auth Token (a master credential that can send SMS from any number), which expands the credential blast radius beyond what the API Key approach allows.
 
-### Shared Shopping Mode
-A "checked off" state per item so family members can mark items as picked up while shopping. Would require adding a `checkedBy` field to each item and a new `check {#}` command.
+The existing `isAuthorized` check — verifying `From` against `authorizedNumbers` — is a sufficient substitute at this scale. A forged request would need both the `To` Twilio number and a valid `From` from the allowlist.
+
+**Implementation when ready:** Add `validateExpressRequest` as middleware in `routes/sms.js`. Store the Auth Token in SSM at `/grocerylist/twilio/authToken`.
+
+### Item Check-Off State
+
+A "picked up" flag per item for use while shopping. Would require changing `items` from `List<String>` to `List<Map>` (e.g. `[{"name": "milk", "checked": false}]`). Would need a new `check {#}` SMS command and a corresponding MCP tool.
+
+### Read-Only Web View
+
+A simple static page at `grocerylist.vezcore.com` showing the current list. Could be served from S3 + CloudFront with a Lambda-backed API GET endpoint for the list data. No auth needed if read-only.
 
 ---
 
 ## Known Limitations
 
-- **No Twilio webhook signature validation.** Twilio's `validateExpressRequest` helper would let us reject forged requests before any DynamoDB work. However, it requires the Twilio Auth Token — a master account credential that can send SMS from any number and read call logs. Storing it in SSM would widen the credential blast radius beyond what the current API Key approach allows. The existing `isAuthorized` check (DynamoDB lookup of the `From` number against `authorizedNumbers`) is a sufficient substitute at this scale: a forged request would need to know both the `To` Twilio number and a valid `From` number from the tenant's allow-list. This is an intentional trade-off, not an oversight.
+### No Twilio Webhook Signature Validation
+See above. Intentional trade-off documented here for future reference.
+
+### SSE Buffering Through Lambda
+The MCP `WebStandardStreamableHTTPServerTransport` can return either JSON or SSE (text/event-stream) responses. `serverless-http` buffers the full response before returning it to API Gateway — there is no true streaming. For tool calls, ChatGPT sends a single POST and waits for the full response, so buffered SSE works correctly. If a future use case requires true streaming (e.g. long-running operations with progress updates), the alternative is Lambda Function URLs with response streaming enabled.
+
+### In-Memory Secrets Cache Not Shared Across Containers
+Twilio credentials are fetched from SSM once per Lambda container and cached in memory. At low traffic (one or two containers), this is fine. At higher concurrency, multiple containers each make their own SSM call on cold start. At this scale this is not a problem, but worth knowing.

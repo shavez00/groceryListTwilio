@@ -1,40 +1,44 @@
 # Coding & Documentation Standards
 
-Standards to follow when making changes to this project. These keep the codebase consistent and the CI/CD pipeline reliable.
+## General Principles
+
+- **Infrastructure is code.** Every AWS resource lives in `template.yaml`. Never create or modify resources manually — they will be overwritten on the next deploy.
+- **Secrets never touch the codebase.** Twilio credentials go in SSM. The `mcpApiKey` lives in DynamoDB (not SSM) but is never logged or committed to git.
+- **`master` is always deployable.** Run `npm test` before pushing. The CI/CD pipeline also runs tests, but a broken `master` blocks all deploys.
+- **Never log sensitive values.** No bearer tokens, `mcpApiKey` values, phone numbers, or `Authorization` headers in logs. Phone numbers in `lastModifiedBy` are normalized to `"sms-user"`. Tenant IDs in error logs use a SHA-256 hash, not the phone number.
 
 ---
 
-## General Principles
+## File Organization
 
-- **One file for the application.** `twilio.js` contains all application logic. Don't split it into multiple files unless the file grows beyond ~300 lines.
-- **Infrastructure is code.** Every AWS resource lives in `template.yaml`. Never create or modify AWS resources manually through the console — they will be overwritten on the next deploy.
-- **Secrets never touch the codebase.** Credentials go in SSM Parameter Store. No secrets in code, `.env` files, or git history.
-- **The `master` branch is always deployable.** Never push broken code to `master`. Test locally before pushing.
+The application is split across focused files:
+
+| File | Rule |
+|------|------|
+| `twilio.js` | Entry point only. Mounts routers, owns SSM cache. No business logic. |
+| `src/repository.js` | DynamoDB operations only. No business logic, no Express, no MCP concepts. |
+| `src/service.js` | Business logic only. No Express, no TwiML, no MCP. Both SMS and MCP call this. |
+| `src/mcp.js` | MCP server, bearer auth, tool definitions. Calls `service.js`. |
+| `routes/sms.js` | SMS handler, TwiML responses. Calls `service.js`. |
+| `routes/oauth.js` | OAuth 2.0 endpoints. No list logic. |
+
+If `twilio.js` or any file grows significantly, extract further — but don't split without a reason.
 
 ---
 
 ## JavaScript Style
 
-**Formatting:**
-- 2-space indentation
-- Single quotes for strings (except template literals)
-- Semicolons at end of statements
-- `const` by default; `let` when reassignment is needed; never `var`
-
-**Async:**
+- 2-space indentation, single quotes, semicolons, `const` by default
 - All DynamoDB and SSM calls are `async/await` — no raw `.then()` chains
-- The Express route handler is `async` — unhandled rejections will crash the Lambda invocation and return a 502, so always `await` async calls inside the handler
+- No comments for obvious code. Comments only for non-obvious WHY (hidden constraint, subtle invariant, workaround):
 
-**Error handling:**
-- The application currently does not have try/catch around DynamoDB calls. For a hobby project this is acceptable — Lambda will return a 502 and Twilio will retry. If you add error handling, return a valid TwiML response so Twilio doesn't retry unnecessarily.
-
-**No comments for obvious code.** Comments are only for non-obvious behavior:
 ```js
-// Good: explains WHY (caching to avoid SSM latency on warm invocations)
-let twilioSecrets = null;
+// Good: explains WHY
+// attribute_not_exists handles items written before the version field was added
+ConditionExpression: 'attribute_not_exists(#v) OR #v = :expected'
 
 // Bad: explains WHAT (the code already says this)
-// Create a new MessagingResponse object
+// Create a new response
 const twiml = new MessagingResponse();
 ```
 
@@ -42,84 +46,71 @@ const twiml = new MessagingResponse();
 
 ## Adding a New SMS Command
 
-1. Add a new `else if (response.startsWith('yourcommand'))` block in the command parser section
-2. Add a `case 'yourcommand':` block in the `switch` statement
-3. Follow the existing pattern: `async` operations with `await`, always `break` at the end of each case
-4. Update the `default` case help message to include the new command
-5. Update [how-it-works.md](how-it-works.md) with the new command in the commands table
+1. Add a new `else if` branch in the command parser in `routes/sms.js`
+2. Add a `case` block in the `switch` statement
+3. Call the appropriate function in `src/service.js` (or add one if needed)
+4. Update the `default` help message
+5. Update [how-it-works.md](how-it-works.md) with the new command
 
-**Example pattern:**
-```js
-// In the command parser
-else if (response.startsWith('mycommand')) command = 'mycommand';
+---
 
-// In the switch statement
-case 'mycommand': {
-  const arg = body.substring('mycommand'.length + 1).trim();
-  // ... do something with DynamoDB ...
-  twiml.message(`Done: ${arg}`);
-  break;
-}
-```
+## Adding a New MCP Tool
+
+1. Add a `server.registerTool(...)` call in `buildMcpServer()` in `src/mcp.js`
+2. Add or reuse a function in `src/service.js` for the logic
+3. Set tool annotations accurately (`readOnlyHint`, `destructiveHint`, `idempotentHint`)
+4. Add tests in `test/mcp.test.js`
+5. Update [how-it-works.md](how-it-works.md)
 
 ---
 
 ## Adding Infrastructure
 
-Edit `template.yaml`. SAM/CloudFormation resource types to know:
+Edit `template.yaml`. Common patterns:
 
-| Need | CloudFormation / SAM type |
-|------|--------------------------|
-| New Lambda function | `AWS::Serverless::Function` |
-| New API route | Add an `Events` entry to an existing function |
-| New DynamoDB table | `AWS::DynamoDB::Table` |
-| New environment variable | Add to `Globals.Function.Environment.Variables` |
-| New IAM permission for Lambda | Add a SAM policy to the function's `Policies` list |
-
-After editing `template.yaml`, push to `master`. CloudFormation will compute a changeset and apply only the diff — it won't recreate resources that haven't changed.
+| Need | Type |
+|------|------|
+| New API route | Add an `Events` entry under `GroceryListFunction` |
+| New DynamoDB table | `AWS::DynamoDB::Table` — always add `DeletionPolicy: Retain` |
+| New GSI | Add to `AttributeDefinitions` and `GlobalSecondaryIndexes` in the table resource |
+| New env variable | Add to `Globals.Function.Environment.Variables` |
+| New IAM permission | Add a SAM policy to `GroceryListFunction.Properties.Policies` |
 
 ---
 
 ## Dependencies
 
-**Adding a new npm package:**
 ```bash
-npm install some-package
-# This updates both package.json and package-lock.json
+npm install some-package    # updates package.json + package-lock.json
 git add package.json package-lock.json
 ```
 
-Always commit `package-lock.json`. The CI/CD pipeline uses `npm ci` which requires it.
+Always commit `package-lock.json` — CI uses `npm ci` which requires it.
 
-**Do not add devDependencies** unless you add a local test runner. The Lambda deployment bundles everything in `dependencies` — devDependencies are excluded by SAM's build process (which is a feature, not a bug, since they'd bloat the Lambda package).
-
-**Keep dependencies minimal.** Every dependency is bundled into the Lambda deployment package and increases cold start time. Prefer AWS SDK packages (already in the Lambda runtime) and avoid large utility libraries when a few lines of native JavaScript will do.
+Keep dependencies minimal. Every dependency is bundled into the Lambda package and increases cold start time. New production dependencies (non-dev) are included in the Lambda deployment.
 
 ---
 
 ## Git Workflow
 
-This is a single-developer project with direct commits to `master`.
+Direct commits to `master`. Each commit should leave the app deployable and tests passing.
 
 **Commit message format:**
 ```
 Short summary in imperative mood (under 72 chars)
 
-Optional longer explanation of WHY the change was made, not WHAT
-it does (the diff shows what). Include context that won't be
+Optional explanation of WHY, not WHAT. Include context that won't be
 obvious from reading the code.
 ```
 
-**Good examples:**
+**Good:**
 ```
-Add remove-by-name command as alternative to remove-by-number
-
-Fix authorization check returning true for unknown tenants
-
-Increase Lambda timeout from 15s to 30s for slow DynamoDB cold starts
+Fix 406 on live MCP endpoint by bypassing Hono header bridge
+Add OAuth client_credentials endpoint for ChatGPT MCP connector
+Increase Lambda timeout to 29s to match API Gateway maximum
 ```
 
-**Bad examples:**
+**Bad:**
 ```
 fix bug
 updated code
@@ -128,26 +119,31 @@ WIP
 
 ---
 
-## Documentation Standards
+## Testing
 
-- Keep docs in the `docs/` folder
-- Write for a junior developer who has never seen this project
-- When you change application behavior, update [how-it-works.md](how-it-works.md)
-- When you add AWS resources, update [architecture.md](architecture.md)
-- When you change the data schema, update [data-model.md](data-model.md)
-- When you change the deployment process, update [deployment.md](deployment.md)
+Run `npm test` before pushing. The suite must be green.
 
-Documentation is committed and pushed just like code. Out-of-date docs are worse than no docs.
+```bash
+npm test          # run all 67 tests
+npm run lint      # syntax check all JS files
+```
+
+**Test files:**
+- `twilio.test.js` — SMS endpoint tests (root, not in `test/`)
+- `test/service.test.js` — service layer unit tests with mocked repository
+- `test/mcp.test.js` — MCP HTTP integration tests with mocked repository
+
+**Adding tests:** Any new command, tool, or behavior needs a test. Mock DynamoDB at the repository layer (not at the AWS SDK level) — see existing tests for the pattern.
 
 ---
 
-## Testing
+## Documentation Standards
 
-There are no automated tests in this project. Before pushing:
+- Write for a developer who has never seen this project
+- When you change application behavior → update [how-it-works.md](how-it-works.md)
+- When you add AWS resources → update [architecture.md](architecture.md)
+- When you change the data schema → update [data-model.md](data-model.md)
+- When you change the deployment process → update [deployment.md](deployment.md)
+- When you add a new file → update [codebase.md](codebase.md)
 
-1. **Syntax check:** `node --check twilio.js` — catches syntax errors without running the code
-2. **Dependency check:** `npm ci` — verifies the lockfile is consistent
-3. **Local run:** `node twilio.js` — verifies the server starts on port 8080
-4. **Smoke test** against the live endpoint after deploy (see [Operations Guide](operations.md))
-
-If you add tests in the future, add a `test` script to `package.json` and add a test step to `.github/workflows/deploy.yml` before the SAM deploy step.
+Out-of-date docs are worse than no docs.

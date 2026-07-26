@@ -2,128 +2,102 @@
 
 ## Overview
 
-Every push to the `master` branch automatically deploys the application to AWS. There is no manual deploy step. The pipeline is defined in `.github/workflows/deploy.yml` and runs on GitHub's hosted infrastructure.
+Every push to `master` automatically deploys the application to AWS. Pushes that only change `docs/` or `*.md` files are skipped (path filter). The pipeline is defined in `.github/workflows/deploy.yml`.
 
 ```
-Developer pushes to master
+Push to master (non-docs)
          │
          ▼
-  GitHub Actions triggered
+  GitHub Actions (ubuntu-latest)
          │
-    ┌────▼────────────────────────────────────────────┐
-    │  Job: deploy (ubuntu-latest runner)             │
-    │                                                 │
-    │  1. Checkout code                               │
-    │  2. Set up Node.js 20 (with npm cache)          │
-    │  3. npm ci  (install exact locked deps)         │
-    │  4. Configure AWS credentials                   │
-    │  5. Set up SAM CLI                              │
-    │  6. sam build  (bundle Lambda code)             │
-    │  7. sam deploy (update CloudFormation stack)    │
-    └─────────────────────────────────────────────────┘
-         │
-         ▼
-  AWS CloudFormation applies changes
+    ┌────▼──────────────────────────────────────┐
+    │  1. Checkout code                          │
+    │  2. Set up Node.js 20 (npm cache)          │
+    │  3. npm ci                                 │
+    │  4. Syntax check (node --check)            │
+    │  5. npm test (67 tests must pass)          │
+    │  6. Configure AWS credentials              │
+    │  7. Set up SAM CLI                         │
+    │  8. sam validate                           │
+    │  9. sam build                              │
+    │  10. sam deploy                            │
+    └────────────────────────────────────────────┘
          │
          ▼
-  Lambda updated, infrastructure changes applied
+  CloudFormation applies changeset
+         │
+         ▼
+  Lambda updated, API Gateway routes updated
 ```
 
-## Pipeline Steps Explained
+## Pipeline Steps
 
-### Step 1 — Checkout
+### Syntax check
 ```yaml
-- uses: actions/checkout@v4
+- run: node --check twilio.js && find src routes -name '*.js' -exec node --check {} \;
 ```
-Clones the repository onto the runner.
+Catches syntax errors in all JS files before running tests or touching AWS.
 
-### Step 2 — Set up Node.js
+### Tests
 ```yaml
-- uses: actions/setup-node@v4
-  with:
-    node-version: '20'
-    cache: 'npm'
+- run: npm test
 ```
-Installs Node.js 20 and enables npm caching so subsequent runs don't re-download packages if `package-lock.json` hasn't changed.
+All 67 tests must pass. A failing test blocks the deploy.
 
-### Step 3 — Install dependencies
+### SAM validate
 ```yaml
-- run: npm ci
+- run: sam validate --region us-west-2
 ```
-`npm ci` installs exactly the versions recorded in `package-lock.json`. Unlike `npm install`, it never silently upgrades packages and will fail if `package-lock.json` is out of sync with `package.json`. This makes builds reproducible.
+Validates `template.yaml` against the CloudFormation schema before deploying.
 
-### Step 4 — Configure AWS credentials
+### SAM deploy
 ```yaml
-- uses: aws-actions/configure-aws-credentials@v4
-  with:
-    aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-    aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-    aws-region: ${{ secrets.AWS_REGION }}
+sam deploy \
+  --no-confirm-changeset \
+  --no-fail-on-empty-changeset \
+  --stack-name grocery-list-twilio \
+  --parameter-overrides \
+    HostedZoneId=${{ secrets.ROUTE53_HOSTED_ZONE_ID }} \
+    AcmCertificateArn=${{ secrets.ACM_CERTIFICATE_ARN }} \
+  --capabilities CAPABILITY_IAM \
+  --resolve-s3
 ```
-Injects temporary AWS credentials from GitHub Secrets into the runner environment. The IAM user (`github-actions-grocery-list`) has a least-privilege policy — only the permissions needed to deploy this specific stack.
 
-### Step 5 — Set up SAM CLI
+- `--no-fail-on-empty-changeset` — exits 0 if nothing changed (prevents spurious failures)
+- `--resolve-s3` — auto-creates an S3 bucket for deployment artifacts
+
+## Path Filter
+
+Pushes that only change files in `docs/` or `*.md` files at the repo root are skipped entirely:
+
 ```yaml
-- uses: aws-actions/setup-sam@v2
-```
-Installs the AWS SAM CLI on the runner.
-
-### Step 6 — SAM build
-```yaml
-- run: sam build
-```
-SAM bundles the Lambda function code and its `node_modules` into a `.aws-sam/build/` directory, ready for upload to S3. This step resolves the `CodeUri: .` in `template.yaml` into a deployable artifact.
-
-### Step 7 — SAM deploy
-```yaml
-- run: |
-    sam deploy \
-      --no-confirm-changeset \
-      --no-fail-on-empty-changeset \
-      --stack-name grocery-list-twilio \
-      --parameter-overrides \
-        HostedZoneId=${{ secrets.ROUTE53_HOSTED_ZONE_ID }} \
-        AcmCertificateArn=${{ secrets.ACM_CERTIFICATE_ARN }} \
-      --capabilities CAPABILITY_IAM \
-      --resolve-s3
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
 ```
 
-- `--no-confirm-changeset` — deploys without asking for confirmation (required for automation)
-- `--no-fail-on-empty-changeset` — exits 0 if nothing changed (prevents spurious pipeline failures on empty commits)
-- `--stack-name grocery-list-twilio` — the CloudFormation stack to create or update
-- `--parameter-overrides` — passes in the hosted zone ID and ACM cert ARN from GitHub Secrets
-- `--capabilities CAPABILITY_IAM` — grants CloudFormation permission to create IAM roles (needed for the Lambda execution role)
-- `--resolve-s3` — automatically creates an S3 bucket for the deployment artifact if one doesn't exist
+If a push includes both docs and code changes, the deploy runs normally.
 
 ## GitHub Secrets
 
-These are configured in the GitHub repository under **Settings → Secrets and variables → Actions**.
+Configured in **Settings → Secrets and variables → Actions**.
 
-| Secret Name | What it contains |
-|-------------|-----------------|
-| `AWS_ACCESS_KEY_ID` | Access key for the `github-actions-grocery-list` IAM user |
-| `AWS_SECRET_ACCESS_KEY` | Secret key for the `github-actions-grocery-list` IAM user |
+| Secret | Value |
+|--------|-------|
+| `AWS_ACCESS_KEY_ID` | IAM user access key |
+| `AWS_SECRET_ACCESS_KEY` | IAM user secret key |
 | `AWS_REGION` | `us-west-2` |
-| `ROUTE53_HOSTED_ZONE_ID` | `Z29XWUV2I47AQU` (the vezcore.com hosted zone) |
-| `ACM_CERTIFICATE_ARN` | ARN of the validated ACM cert for grocerylist.vezcore.com |
-
-**Secrets are never printed in logs.** GitHub Actions automatically masks any value that matches a registered secret.
-
-## What Triggers a Deployment
-
-- Any `git push` to the `master` branch — code changes, infrastructure changes, or even an empty commit
-
-## What Does NOT Trigger a Deployment
-
-- Pushes to any other branch
-- Pull requests (there is no PR workflow configured — this is a solo project)
-- Changes to files in `docs/` still trigger a deploy (the entire branch is built). If this becomes a concern, a path filter can be added.
+| `ROUTE53_HOSTED_ZONE_ID` | `Z29XWUV2I47AQU` |
+| `ACM_CERTIFICATE_ARN` | ARN of the validated cert |
 
 ## Viewing Deploy Status
 
 ```bash
 # List recent runs
-gh run list --repo shavez00/groceryListTwilio
+gh run list --repo shavez00/groceryListTwilio --limit 5
 
 # Watch a run live
 gh run watch <run-id> --repo shavez00/groceryListTwilio
@@ -132,24 +106,21 @@ gh run watch <run-id> --repo shavez00/groceryListTwilio
 gh run view <run-id> --repo shavez00/groceryListTwilio --log-failed
 ```
 
-Or visit: `https://github.com/shavez00/groceryListTwilio/actions`
+Or: `https://github.com/shavez00/groceryListTwilio/actions`
 
-## Deployment Duration
+## Deploy Duration
 
-A typical deploy takes **2–3 minutes**:
-- ~30s for checkout, Node setup, npm install
-- ~15s for SAM build
-- ~90–120s for CloudFormation to apply changes (Lambda update is fast; infrastructure changes like DynamoDB or API Gateway take longer)
-
-If nothing changed in the CloudFormation template, `--no-fail-on-empty-changeset` causes the deploy step to skip the CloudFormation update and exit immediately after SAM validates the template.
+Typical: **1.5–2.5 minutes**
+- ~30s: checkout, Node setup, npm install, syntax check, tests
+- ~15s: SAM build
+- ~60–90s: CloudFormation changeset (Lambda-only changes are fast; API Gateway or DynamoDB changes take longer)
 
 ## Rollback
 
-SAM deploy uses CloudFormation changesets. If a deployment fails mid-way, CloudFormation automatically rolls back to the previous known-good state. Lambda functions are versioned — the previous code is restored.
-
-If a deployment succeeds but introduces a bug, roll back by reverting the commit and pushing:
+If a deployment succeeds but introduces a bug:
 ```bash
 git revert HEAD
-git push origin master
+git push origin master   # triggers a fresh deploy of the reverted code
 ```
-This creates a new commit that undoes the change and triggers a fresh deploy.
+
+CloudFormation also automatically rolls back on mid-deploy failures.

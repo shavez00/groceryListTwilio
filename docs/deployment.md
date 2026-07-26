@@ -1,137 +1,74 @@
 # Deployment Guide
 
-This guide covers everything needed to deploy this application from scratch into a new AWS account or after a full teardown. If you are just making code changes to an existing deployment, push to `master` and CI/CD handles it.
+This guide covers everything needed to deploy from scratch into a new AWS account. For code changes to an existing deployment, push to `master` — CI/CD handles the rest.
 
 ## Prerequisites
 
 ### Accounts and Access
-
-- [ ] **AWS account** with admin or sufficiently privileged access
-- [ ] **Twilio account** with at least one purchased phone number
-- [ ] **GitHub account** with a fork or clone of this repository
-- [ ] **Domain in Route 53** — a hosted zone for your domain (e.g. `vezcore.com`)
+- [ ] AWS account with admin access
+- [ ] Twilio account with at least one purchased phone number
+- [ ] GitHub account with a fork/clone of this repository
+- [ ] Domain in Route 53 (a hosted zone, e.g. `vezcore.com`)
 
 ### Local Tools
-
-Install these on your development machine:
-
 ```bash
-# Node.js 20+
-node --version   # should be v20.x or higher
-
-# AWS CLI v2
-aws --version
-
-# AWS SAM CLI
-sam --version
-
-# GitHub CLI (optional but useful)
-gh --version
+node --version   # v20.x or higher
+aws --version    # AWS CLI v2
+sam --version    # AWS SAM CLI
+gh --version     # GitHub CLI (optional)
 ```
 
-**Install links:**
-- Node.js: https://nodejs.org
-- AWS CLI: https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html
-- SAM CLI: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html
-- GitHub CLI: https://cli.github.com
-
-### AWS CLI Configuration
-
-```bash
-aws configure
-# AWS Access Key ID: <your key>
-# AWS Secret Access Key: <your secret>
-# Default region name: us-west-2
-# Default output format: json
-```
+**Install links:** [Node.js](https://nodejs.org) | [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) | [SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) | [GitHub CLI](https://cli.github.com)
 
 ---
 
 ## Step 1 — Store Twilio Credentials in SSM
 
-The app fetches Twilio credentials from SSM Parameter Store at runtime. Store them as `SecureString` (KMS-encrypted) values.
-
-You need three values from your Twilio console:
-- **Account SID** — starts with `AC`, found on the Twilio dashboard
-- **API Key SID** — starts with `SK`, created under Account → API Keys
-- **API Key Secret** — the secret shown once when you create the API key (save it)
-
 ```bash
 aws ssm put-parameter \
   --name /grocerylist/twilio/accountSID \
   --value "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
-  --type SecureString \
-  --region us-west-2
+  --type SecureString --region us-west-2
 
 aws ssm put-parameter \
   --name /grocerylist/twilio/apiKeySID \
   --value "SKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
-  --type SecureString \
-  --region us-west-2
+  --type SecureString --region us-west-2
 
 aws ssm put-parameter \
   --name /grocerylist/twilio/apiKeySecret \
-  --value "your_api_key_secret_here" \
-  --type SecureString \
-  --region us-west-2
+  --value "your_api_key_secret" \
+  --type SecureString --region us-west-2
 ```
+
+You need: Account SID (`AC...`), API Key SID (`SK...`), and API Key Secret — all from the Twilio console under Account → API Keys.
 
 ---
 
 ## Step 2 — Request and Validate an ACM Certificate
 
-The custom domain requires a TLS certificate. ACM provides this for free.
-
 ```bash
 aws acm request-certificate \
   --domain-name grocerylist.yourdomain.com \
-  --validation-method DNS \
-  --region us-west-2
+  --validation-method DNS --region us-west-2
+# Save the returned CertificateArn
 ```
 
-This returns a `CertificateArn`. **Save it** — you need it in Step 5.
-
-Now get the DNS validation record:
-
+Get the DNS validation CNAME and add it to Route 53:
 ```bash
-aws acm describe-certificate \
-  --certificate-arn <your-cert-arn> \
-  --region us-west-2 \
+aws acm describe-certificate --certificate-arn <arn> --region us-west-2 \
   --query "Certificate.DomainValidationOptions[0].ResourceRecord"
-```
 
-This returns a `Name` and `Value` for a CNAME record. Add it to Route 53:
-
-```bash
 aws route53 change-resource-record-sets \
-  --hosted-zone-id <your-zone-id> \
-  --change-batch '{
-    "Changes": [{
-      "Action": "UPSERT",
-      "ResourceRecordSet": {
-        "Name": "<Name from above>",
-        "Type": "CNAME",
-        "TTL": 300,
-        "ResourceRecords": [{"Value": "<Value from above>"}]
-      }
-    }]
-  }'
-```
+  --hosted-zone-id <zone-id> \
+  --change-batch '{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"<Name>","Type":"CNAME","TTL":300,"ResourceRecords":[{"Value":"<Value>"}]}}]}'
 
-Wait for validation (usually under 5 minutes):
-
-```bash
-aws acm wait certificate-validated \
-  --certificate-arn <your-cert-arn> \
-  --region us-west-2
-echo "Certificate validated"
+aws acm wait certificate-validated --certificate-arn <arn> --region us-west-2
 ```
 
 ---
 
 ## Step 3 — Create the GitHub Actions IAM User
-
-Create a dedicated IAM user for CI/CD with least-privilege permissions:
 
 ```bash
 aws iam create-user --user-name github-actions-grocery-list
@@ -159,9 +96,8 @@ aws iam put-user-policy \
   }'
 
 aws iam create-access-key --user-name github-actions-grocery-list
+# Save the AccessKeyId and SecretAccessKey — you cannot retrieve the secret again
 ```
-
-**Save the `AccessKeyId` and `SecretAccessKey` from the last command.** You can't retrieve the secret again.
 
 ---
 
@@ -169,60 +105,37 @@ aws iam create-access-key --user-name github-actions-grocery-list
 
 ```bash
 aws route53 list-hosted-zones \
-  --query "HostedZones[?Name=='yourdomain.com.'].[Id,Name]" \
-  --output table
+  --query "HostedZones[?Name=='yourdomain.com.'].[Id,Name]" --output table
+# Zone ID is the part after /hostedzone/
 ```
-
-The zone ID looks like `Z29XWUV2I47AQU` (the part after `/hostedzone/`).
 
 ---
 
 ## Step 5 — Configure GitHub Secrets
 
-In your GitHub repository: **Settings → Secrets and variables → Actions → New repository secret**
+**Settings → Secrets and variables → Actions → New repository secret**
 
-Add all five secrets:
-
-| Secret Name | Value |
-|-------------|-------|
+| Secret | Value |
+|--------|-------|
 | `AWS_ACCESS_KEY_ID` | From Step 3 |
 | `AWS_SECRET_ACCESS_KEY` | From Step 3 |
 | `AWS_REGION` | `us-west-2` |
 | `ROUTE53_HOSTED_ZONE_ID` | From Step 4 |
 | `ACM_CERTIFICATE_ARN` | From Step 2 |
 
-Or use the GitHub CLI:
-
-```bash
-gh secret set AWS_ACCESS_KEY_ID      --repo youruser/groceryListTwilio --body "AKIA..."
-gh secret set AWS_SECRET_ACCESS_KEY  --repo youruser/groceryListTwilio --body "..."
-gh secret set AWS_REGION             --repo youruser/groceryListTwilio --body "us-west-2"
-gh secret set ROUTE53_HOSTED_ZONE_ID --repo youruser/groceryListTwilio --body "Z..."
-gh secret set ACM_CERTIFICATE_ARN    --repo youruser/groceryListTwilio --body "arn:aws:acm:..."
-```
-
 ---
 
 ## Step 6 — Deploy
 
-Push to `master`. GitHub Actions handles the rest.
-
 ```bash
 git push origin master
+gh run watch --repo youruser/groceryListTwilio   # watch it live
 ```
 
-Watch the deploy:
-```bash
-gh run list --repo youruser/groceryListTwilio
-gh run watch <run-id> --repo youruser/groceryListTwilio
-```
-
-The deploy takes 2–4 minutes. When it succeeds, verify the stack:
-
+Takes 2–4 minutes. Verify:
 ```bash
 aws cloudformation describe-stacks \
-  --stack-name grocery-list-twilio \
-  --region us-west-2 \
+  --stack-name grocery-list-twilio --region us-west-2 \
   --query "Stacks[0].[StackStatus,Outputs]"
 ```
 
@@ -230,68 +143,74 @@ aws cloudformation describe-stacks \
 
 ## Step 7 — Seed the First Tenant
 
-The authorization system requires at least one tenant record before the app will accept any SMS. Replace the values below with your Twilio number, family name, and authorized phone numbers.
-
-Generate a UUID for `mcpApiKey` with `uuidgen` or https://www.uuidgenerator.net.
+Generate a UUID for `mcpApiKey`:
+```bash
+uuidgen
+```
 
 ```bash
 aws dynamodb put-item \
-  --table-name GroceryTenants \
-  --region us-west-2 \
+  --table-name GroceryTenants --region us-west-2 \
   --item '{
     "tenantId":          {"S": "+1XXXXXXXXXX"},
     "familyName":        {"S": "Your Family"},
-    "authorizedNumbers": {"L": [{"S": "+1XXXXXXXXXX"}, {"S": "+1XXXXXXXXXX"}]},
-    "mcpApiKey":         {"S": "your-uuid-here"},
+    "authorizedNumbers": {"L": [{"S": "+1XXXXXXXXXX"}]},
+    "mcpApiKey":         {"S": "your-generated-uuid"},
     "createdAt":         {"S": "2026-01-01T00:00:00Z"}
   }'
+```
+
+Then populate `mcpApiKeyHash` (required for MCP bearer auth):
+```bash
+bash backfill-mcp-key-hash.sh
 ```
 
 ---
 
 ## Step 8 — Configure Twilio Webhook
 
-In the Twilio console, set the webhook for your phone number:
-
-1. Go to **Phone Numbers → Manage → Active numbers**
-2. Click your number
-3. Under **Messaging**, set **"A message comes in"** to:
-   - Type: `Webhook`
+In the Twilio console:
+1. **Phone Numbers → Manage → Active numbers** → click your number
+2. Under **Messaging**, set **"A message comes in"**:
    - URL: `https://grocerylist.yourdomain.com/sms`
    - Method: `HTTP POST`
-4. Save
+3. Save
 
 ---
 
-## Step 9 — Smoke Test
+## Step 9 — Connect ChatGPT (MCP)
 
+1. In ChatGPT, go to **Settings → Connectors** (or Developer Mode → MCP)
+2. Add a new connector with Server URL: `https://grocerylist.yourdomain.com/mcp`
+3. ChatGPT will redirect you to the OAuth sign-in page
+4. Enter your `mcpApiKey` UUID and sign in
+5. ChatGPT should discover all 5 tools
+
+---
+
+## Step 10 — Smoke Test
+
+**SMS:**
 ```bash
 curl -s -X POST https://grocerylist.yourdomain.com/sms \
-  -d "To=+1XXXXXXXXXX&From=+1AUTHORIZEDNUM&Body=list"
+  -d "To=%2B1TWILIONUMBER&From=%2B1AUTHORIZEDNUM&Body=list"
+# Expected: TwiML XML with "List is currently empty."
 ```
 
-You should see a TwiML XML response: `<Message>List is currently empty.</Message>`
+**MCP:**
+```bash
+curl -s -X POST https://grocerylist.yourdomain.com/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer your-mcpApiKey-uuid" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+# Expected: JSON or SSE response listing all 5 tools
+```
+
+**OAuth discovery:**
+```bash
+curl -s https://grocerylist.yourdomain.com/.well-known/oauth-authorization-server
+# Expected: JSON with issuer, token_endpoint, etc.
+```
 
 Or just text the number `list` from an authorized phone.
-
----
-
-## Updating the Domain Name
-
-If you want to use a different subdomain, edit `template.yaml`:
-
-```yaml
-Parameters:
-  DomainName:
-    Type: String
-    Default: yournewsubdomain.yourdomain.com
-```
-
-Then request a new ACM cert for that domain, update the `ACM_CERTIFICATE_ARN` secret, and push.
-
-## Deploying to a Different Region
-
-The app can run in any AWS region. Update:
-1. `AWS_REGION` GitHub Secret
-2. The `--region` flag in all `aws` CLI commands above
-3. Request the ACM cert in the new region (certs are regional for API Gateway)
