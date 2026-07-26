@@ -3,6 +3,9 @@ name: Deploy to AWS Lambda
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
 
 jobs:
   deploy:
@@ -19,6 +22,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Syntax check
+        run: |
+          node --check twilio.js
+          find src routes -name '*.js' -exec node --check {} \;
+
       - name: Run tests
         run: npm test
 
@@ -31,6 +39,9 @@ jobs:
 
       - name: Set up SAM CLI
         uses: aws-actions/setup-sam@v2
+
+      - name: SAM validate
+        run: sam validate --region us-west-2
 
       - name: SAM build
         run: sam build

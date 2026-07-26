@@ -54,9 +54,9 @@ function setupDynamo({ authorizedNumbers = ['+15550000001'], items = [] } = {}) 
       });
     }
     if (table === 'GroceryLists') {
-      // PutCommand has no Key
+      // PutCommand has an Item field; GetCommand does not
       if (cmd.input?.Item) return Promise.resolve({});
-      return Promise.resolve({ Item: { items } });
+      return Promise.resolve({ Item: { items, version: 0 } });
     }
     return Promise.resolve({});
   });
@@ -178,6 +178,68 @@ describe('unknown command', () => {
     setupDynamo({ items: [] });
     const res = await sms(TO, FROM, 'hello');
     expect(res.text).toContain('Commands:');
+  });
+});
+
+describe('announce command', () => {
+  test('announces to all authorized numbers', async () => {
+    // Twilio client mock — suppress actual HTTP calls
+    jest.mock('twilio', () => {
+      const mockCreate = jest.fn().mockResolvedValue({});
+      return jest.fn(() => ({ messages: { create: mockCreate } }));
+    });
+
+    mockDynamoSend.mockImplementation(cmd => {
+      const table = cmd.input?.TableName;
+      if (table === 'GroceryTenants') {
+        return Promise.resolve({
+          Item: {
+            tenantId: TO,
+            authorizedNumbers: [FROM, '+15550000002'],
+            familyName: 'Test',
+          },
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const res = await sms(TO, FROM, 'announce dinner is ready');
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('Announced to 2 number(s)');
+  });
+
+  test('announce with no authorized numbers returns error', async () => {
+    // Auth check reads GroceryTenants (FROM must be authorized), then announce reads it again
+    // Both reads return the same record; FROM is authorized but authorizedNumbers is empty
+    // so the announce broadcast loop sends to no one.
+    mockDynamoSend.mockImplementation(cmd => {
+      const table = cmd.input?.TableName;
+      if (table === 'GroceryTenants') {
+        // FROM (+15550000001) must be in authorizedNumbers for the auth check to pass,
+        // but the announce should report sending to however many numbers exist.
+        // Use a single authorized number so auth passes and announce sends to 1.
+        // To test the empty-targets path we need authorizedNumbers to be empty after auth.
+        // The simplest approach: make the first call (auth) return FROM, subsequent calls empty.
+        if (!mockDynamoSend._announceCallCount) mockDynamoSend._announceCallCount = 0;
+        mockDynamoSend._announceCallCount++;
+        if (mockDynamoSend._announceCallCount === 1) {
+          // Auth check
+          return Promise.resolve({
+            Item: { tenantId: TO, authorizedNumbers: [FROM], familyName: 'Test' },
+          });
+        }
+        // Announce read — return empty list
+        return Promise.resolve({
+          Item: { tenantId: TO, authorizedNumbers: [], familyName: 'Test' },
+        });
+      }
+      return Promise.resolve({});
+    });
+    mockDynamoSend._announceCallCount = 0;
+
+    const res = await sms(TO, FROM, 'announce hello');
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('No authorized numbers');
   });
 });
 

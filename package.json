@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node twilio.js",
     "dev": "node twilio.js",
+    "lint": "node --check twilio.js && find src routes -name '*.js' -exec node --check {} \\;",
     "test": "jest"
   },
   "devDependencies": {
@@ -16,9 +17,11 @@
     "@aws-sdk/client-dynamodb": "^3.600.0",
     "@aws-sdk/client-ssm": "^3.600.0",
     "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "body-parser": "^1.20.3",
     "express": "^4.19.2",
     "serverless-http": "^3.2.0",
-    "twilio": "^5.3.0"
+    "twilio": "^5.3.0",
+    "zod": "^3.25.76"
   }
 }

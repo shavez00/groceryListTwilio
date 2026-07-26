@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Grocery List Twilio webhook on Lambda + API Gateway + DynamoDB
+Description: Grocery List Twilio webhook + MCP server on Lambda + API Gateway + DynamoDB
 
 Parameters:
   DomainName:
@@ -16,8 +16,8 @@ Parameters:
 Globals:
   Function:
     Runtime: nodejs20.x
-    Timeout: 15
-    MemorySize: 128
+    Timeout: 29
+    MemorySize: 256
     Environment:
       Variables:
         TENANTS_TABLE: !Ref GroceryTenantsTable
@@ -46,6 +46,12 @@ Resources:
           Properties:
             Path: /sms
             Method: POST
+            ApiId: !Ref GroceryListApi
+        McpEndpoint:
+          Type: HttpApi
+          Properties:
+            Path: /mcp
+            Method: ANY
             ApiId: !Ref GroceryListApi
 
   # ── API Gateway ──────────────────────────────────────────────────────────────
@@ -90,18 +96,31 @@ Resources:
 
   GroceryTenantsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: GroceryTenants
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: tenantId
           AttributeType: S
+        - AttributeName: mcpApiKeyHash
+          AttributeType: S
       KeySchema:
         - AttributeName: tenantId
           KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: mcpApiKeyHash-index
+          KeySchema:
+            - AttributeName: mcpApiKeyHash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
 
   GroceryListsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: GroceryLists
       BillingMode: PAY_PER_REQUEST
@@ -121,7 +140,10 @@ Outputs:
     Description: Default API Gateway endpoint
     Value: !Sub 'https://${GroceryListApi}.execute-api.${AWS::Region}.amazonaws.com/sms'
   CustomDomainEndpoint:
-    Description: Custom domain endpoint (active after DNS propagation)
+    Description: Custom domain SMS endpoint
     Value: !Sub 'https://${DomainName}/sms'
+  McpEndpoint:
+    Description: MCP server endpoint for ChatGPT integration
+    Value: !Sub 'https://${DomainName}/mcp'
   GroceryListFunctionArn:
     Value: !GetAtt GroceryListFunction.Arn
