@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
-const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
+const { WebStandardStreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js');
 const { z } = require('zod');
 const repository = require('./repository');
 const service = require('./service');
@@ -249,16 +249,43 @@ function buildMcpServer() {
   return server;
 }
 
+// Build a Web Standard Request from an Express IncomingMessage.
+// serverless-http never populates rawHeaders, which Hono's getRequestListener
+// depends on. Bypassing Hono and constructing the Request directly ensures
+// headers are preserved correctly through API Gateway → Lambda → serverless-http.
+function buildWebRequest(req) {
+  const protocol = req.headers['x-forwarded-proto'] || 'https';
+  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+  const url = `${protocol}://${host}${req.originalUrl || req.url}`;
+
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value !== undefined) headers.set(key, String(value));
+  }
+
+  const body = req.body ? JSON.stringify(req.body) : undefined;
+  return new Request(url, { method: req.method, headers, body });
+}
+
+// Write a Web Standard Response back into the Express ServerResponse.
+async function writeWebResponse(webRes, res) {
+  res.status(webRes.status);
+  for (const [key, value] of webRes.headers.entries()) {
+    res.set(key, value);
+  }
+  const body = await webRes.text();
+  res.send(body);
+}
+
 // Stateless MCP handler — new transport per request
 router.all('/', async (req, res) => {
   res.set(CORS_HEADERS);
   try {
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const server = buildMcpServer();
     await server.connect(transport);
 
-    // Pass tenantId via req.auth so the transport delivers it to tool handlers as authInfo
-    req.auth = {
+    const authInfo = {
       token: 'bearer',
       clientId: req.mcpTenant.tenantId,
       scopes: ['mcp'],
@@ -266,7 +293,9 @@ router.all('/', async (req, res) => {
       extra: { tenantId: req.mcpTenant.tenantId },
     };
 
-    await transport.handleRequest(req, res, req.body);
+    const webRequest = buildWebRequest(req);
+    const webResponse = await transport.handleRequest(webRequest, { authInfo, parsedBody: req.body });
+    await writeWebResponse(webResponse, res);
   } catch (err) {
     console.error('MCP handler error:', { message: err.message });
     if (!res.headersSent) {
