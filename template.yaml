@@ -59,11 +59,17 @@ Resources:
             Path: /oauth/token
             Method: POST
             ApiId: !Ref GroceryListApi
-        OAuthAuthorize:
+        OAuthAuthorizeGet:
           Type: HttpApi
           Properties:
             Path: /oauth/authorize
             Method: GET
+            ApiId: !Ref GroceryListApi
+        OAuthAuthorizePost:
+          Type: HttpApi
+          Properties:
+            Path: /oauth/authorize
+            Method: POST
             ApiId: !Ref GroceryListApi
         OAuthMetadata:
           Type: HttpApi
