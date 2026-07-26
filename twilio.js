@@ -9,6 +9,7 @@ const { SSMClient, GetParametersCommand } = require('@aws-sdk/client-ssm');
 
 const smsRouter = require('./routes/sms');
 const mcpRouter = require('./src/mcp');
+const oauthRouter = require('./routes/oauth');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -40,6 +41,7 @@ async function getTwilioSecrets() {
 // Share the SSM cache with the SMS route (announce command needs Twilio creds)
 smsRouter.setSecretsProvider(getTwilioSecrets);
 
+app.use(oauthRouter);
 app.use('/mcp', mcpRouter);
 app.use('/sms', smsRouter);
 

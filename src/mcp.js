@@ -33,6 +33,7 @@ async function authMiddleware(req, res, next) {
   try {
     const tenant = await resolveTenant(req.headers.authorization);
     if (!tenant) {
+      res.set('WWW-Authenticate', 'Bearer resource_metadata="https://grocerylist.vezcore.com/.well-known/oauth-protected-resource/mcp"');
       res.status(401).json({ error: 'invalid_token', error_description: 'Missing or invalid bearer token.' });
       return;
     }
