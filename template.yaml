@@ -53,6 +53,30 @@ Resources:
             Path: /mcp
             Method: ANY
             ApiId: !Ref GroceryListApi
+        OAuthToken:
+          Type: HttpApi
+          Properties:
+            Path: /oauth/token
+            Method: POST
+            ApiId: !Ref GroceryListApi
+        OAuthAuthorize:
+          Type: HttpApi
+          Properties:
+            Path: /oauth/authorize
+            Method: GET
+            ApiId: !Ref GroceryListApi
+        OAuthMetadata:
+          Type: HttpApi
+          Properties:
+            Path: /.well-known/oauth-authorization-server
+            Method: GET
+            ApiId: !Ref GroceryListApi
+        OAuthProtectedResource:
+          Type: HttpApi
+          Properties:
+            Path: /.well-known/oauth-protected-resource/mcp
+            Method: GET
+            ApiId: !Ref GroceryListApi
 
   # ── API Gateway ──────────────────────────────────────────────────────────────
 
