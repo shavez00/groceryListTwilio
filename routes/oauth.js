@@ -153,11 +153,12 @@ router.post('/oauth/token', express.urlencoded({ extended: false }), async (req,
 // back to ChatGPT with the key as the code (no server-side session needed
 // since the key itself is a 122-bit secret and is validated again at token exchange).
 router.get('/oauth/authorize', (req, res) => {
-  const { redirect_uri, state, client_id } = req.query;
+  const { redirect_uri, state, client_id, error, error_description } = req.query;
   if (!redirect_uri) {
     return res.status(400).send('Missing redirect_uri');
   }
   res.setHeader('Content-Type', 'text/html');
+  const errorMsg = error_description || (error === 'access_denied' ? 'Phone number not found.' : '');
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -169,22 +170,22 @@ router.get('/oauth/authorize', (req, res) => {
     h1 { font-size: 1.4rem; margin-bottom: 4px; }
     p { color: #555; font-size: 0.9rem; margin-bottom: 24px; }
     label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 6px; }
-    input[type=password] { width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 1rem; border: 1px solid #ccc; border-radius: 6px; margin-bottom: 16px; }
+    input[type=tel] { width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 1rem; border: 1px solid #ccc; border-radius: 6px; margin-bottom: 16px; }
     button { width: 100%; padding: 10px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; }
     button:hover { background: #1d4ed8; }
-    .error { color: #dc2626; font-size: 0.85rem; margin-bottom: 12px; display: none; }
+    .error { color: #dc2626; font-size: 0.85rem; margin-bottom: 12px; ${errorMsg ? '' : 'display: none;'} }
   </style>
 </head>
 <body>
   <h1>Grocery List</h1>
-  <p>Enter your API key to connect ChatGPT to your grocery list.</p>
+  <p>Enter the phone number your family texts grocery items to.</p>
   <form method="POST" action="/oauth/authorize">
     <input type="hidden" name="redirect_uri" value="${escapeHtml(redirect_uri)}">
     <input type="hidden" name="state" value="${escapeHtml(state || '')}">
     <input type="hidden" name="client_id" value="${escapeHtml(client_id || '')}">
-    <label for="api_key">API Key</label>
-    <input type="password" id="api_key" name="api_key" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" required autofocus>
-    <div class="error" id="err">Invalid API key. Check your key and try again.</div>
+    <label for="phone_number">Family Phone Number</label>
+    <input type="tel" id="phone_number" name="phone_number" placeholder="+1 (509) 555-1234" required autofocus>
+    <div class="error" id="err">${escapeHtml(errorMsg)}</div>
     <button type="submit">Sign in</button>
   </form>
 </body>
@@ -192,19 +193,27 @@ router.get('/oauth/authorize', (req, res) => {
 });
 
 router.post('/oauth/authorize', express.urlencoded({ extended: false }), async (req, res) => {
-  const { redirect_uri, state, api_key } = req.body;
+  const { redirect_uri, state, phone_number } = req.body;
 
   if (!redirect_uri) return res.status(400).send('Missing redirect_uri');
-  if (!api_key) return redirectError(res, redirect_uri, state, 'access_denied');
+  if (!phone_number) return redirectError(res, redirect_uri, state, 'access_denied');
 
   try {
-    const hash = crypto.createHash('sha256').update(api_key.trim()).digest('hex');
-    const tenant = await repository.getTenantByApiKeyHash(hash);
-    if (!tenant) return redirectError(res, redirect_uri, state, 'access_denied');
+    const tenantId = normalizePhone(phone_number);
+    if (!tenantId) {
+      return res.redirect(`/oauth/authorize?${new URLSearchParams({ redirect_uri, state, error: 'access_denied', error_description: 'Invalid phone number format.' })}`);
+    }
 
-    // Use the validated key as the authorization code — it's a 122-bit secret
-    // and is re-validated at token exchange, so no server-side session is needed.
-    const params = new URLSearchParams({ code: api_key.trim() });
+    const tenant = await repository.getTenant(tenantId);
+    if (!tenant) {
+      return res.redirect(`/oauth/authorize?${new URLSearchParams({ redirect_uri, state, error: 'access_denied', error_description: 'Phone number not found.' })}`);
+    }
+
+    const secret = await token.getSecret();
+    const codePayload = token.issueCode(tenantId);
+    const code = token.sign(codePayload, secret);
+
+    const params = new URLSearchParams({ code });
     if (state) params.set('state', state);
     return res.redirect(`${redirect_uri}?${params}`);
   } catch (err) {
@@ -212,6 +221,14 @@ router.post('/oauth/authorize', express.urlencoded({ extended: false }), async (
     return redirectError(res, redirect_uri, state, 'server_error');
   }
 });
+
+function normalizePhone(input) {
+  const digits = String(input || '').replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  if (digits.length > 11) return `+${digits}`;
+  return null;
+}
 
 function redirectError(res, redirectUri, state, error) {
   const params = new URLSearchParams({ error });

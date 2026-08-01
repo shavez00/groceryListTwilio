@@ -146,12 +146,12 @@ describe('discovery endpoint', () => {
 // --- Authorization endpoint (GET) ---
 
 describe('authorize GET', () => {
-  test('renders API key form', async () => {
+  test('renders phone number form', async () => {
     const res = await request(app).get('/oauth/authorize?redirect_uri=https://example.com/callback');
     expect(res.status).toBe(200);
     expect(res.text).toContain('Grocery List');
-    expect(res.text).toContain('API Key');
-    expect(res.text).toContain('api_key');
+    expect(res.text).toContain('Family Phone Number');
+    expect(res.text).toContain('phone_number');
   });
 
   test('missing redirect_uri returns 400', async () => {
@@ -172,12 +172,12 @@ describe('authorize GET', () => {
 // --- Authorization endpoint (POST) ---
 
 describe('authorize POST - phone normalization', () => {
-  test('accepts 509-555-1234 format', async () => {
+  test('accepts phone number and redirects with code', async () => {
     const res = await request(app)
       .post('/oauth/authorize')
       .send({
         redirect_uri: 'https://example.com/callback',
-        api_key: TENANT_A_KEY,
+        phone_number: TENANT_A_ID,
         state: 'test-state',
       });
     expect(res.status).toBe(302);
@@ -191,19 +191,19 @@ describe('authorize POST - phone normalization', () => {
       .post('/oauth/authorize')
       .send({
         redirect_uri: 'https://example.com/callback',
-        api_key: TENANT_A_KEY,
+        phone_number: TENANT_A_ID,
         state,
       });
     expect(res.status).toBe(302);
     expect(res.headers.location).toContain(`state=${state}`);
   });
 
-  test('empty API key re-renders form with redirect', async () => {
+  test('unknown phone number returns error redirect', async () => {
     const res = await request(app)
       .post('/oauth/authorize')
       .send({
         redirect_uri: 'https://example.com/callback',
-        api_key: '',
+        phone_number: '+15559999999',
       });
     expect(res.status).toBe(302);
     expect(res.headers.location).toContain('error=access_denied');
@@ -236,7 +236,7 @@ describe('authorize POST - phone normalization', () => {
       .post('/oauth/authorize')
       .send({
         redirect_uri: 'https://example.com/callback',
-        api_key: TENANT_A_KEY,
+        phone_number: TENANT_A_ID,
       });
     expect(res.status).toBe(302);
     const location = res.headers.location;
@@ -244,17 +244,18 @@ describe('authorize POST - phone normalization', () => {
     expect(location).not.toContain('error');
   });
 
-  test('authorization code in redirect equals trimmed API key', async () => {
-    const trimmedKey = TENANT_A_KEY.trim();
+  test('authorization code is a signed token', async () => {
     const res = await request(app)
       .post('/oauth/authorize')
       .send({
         redirect_uri: 'https://example.com/callback',
-        api_key: `  ${TENANT_A_KEY}  `, // with spaces
+        phone_number: TENANT_A_ID,
       });
     expect(res.status).toBe(302);
     const params = new URL(`https://example.com${res.headers.location}`).searchParams;
-    expect(params.get('code')).toBe(trimmedKey);
+    const code = params.get('code');
+    expect(code).toBeDefined();
+    expect(code.includes('.')).toBe(true); // signed token has a dot
   });
 });
 
@@ -546,21 +547,22 @@ describe('end-to-end OAuth flow', () => {
     const getRes = await request(app)
       .get('/oauth/authorize?redirect_uri=https://example.com/callback&state=test123');
     expect(getRes.status).toBe(200);
-    expect(getRes.text).toContain('API Key');
+    expect(getRes.text).toContain('Family Phone Number');
 
-    // Step 2: POST authorize with valid API key
+    // Step 2: POST authorize with valid phone number
     const authRes = await request(app)
       .post('/oauth/authorize')
       .send({
         redirect_uri: 'https://example.com/callback',
-        api_key: TENANT_A_KEY,
+        phone_number: TENANT_A_ID,
         state: 'test123',
       });
     expect(authRes.status).toBe(302);
     const location = authRes.headers.location;
     const params = new URL(`https://example.com${location}`).searchParams;
     const code = params.get('code');
-    expect(code).toBe(TENANT_A_KEY.trim());
+    expect(code).toBeDefined();
+    expect(code.length > 0).toBe(true);
     expect(params.get('state')).toBe('test123');
 
     // Step 3: POST token to exchange code for access token
