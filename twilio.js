@@ -10,6 +10,7 @@ const { SSMClient, GetParametersCommand } = require('@aws-sdk/client-ssm');
 const smsRouter = require('./routes/sms');
 const mcpRouter = require('./src/mcp');
 const oauthRouter = require('./routes/oauth');
+const token = require('./src/token');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -38,8 +39,26 @@ async function getTwilioSecrets() {
   return twilioSecrets;
 }
 
+// Fetch OAuth signing secret for token signing/verification
+let oauthSigningSecret = null;
+async function getOauthSigningSecret() {
+  if (oauthSigningSecret) return oauthSigningSecret;
+  const result = await ssm.send(new GetParametersCommand({
+    Names: ['/grocerylist/oauth/signingSecret'],
+    WithDecryption: true,
+  }));
+  oauthSigningSecret = result.Parameters?.[0]?.Value;
+  if (!oauthSigningSecret) {
+    throw new Error('SSM parameter /grocerylist/oauth/signingSecret not found');
+  }
+  return oauthSigningSecret;
+}
+
 // Share the SSM cache with the SMS route (announce command needs Twilio creds)
 smsRouter.setSecretsProvider(getTwilioSecrets);
+
+// Wire OAuth signing secret for token signing/verification
+token.setSecretsProvider(getOauthSigningSecret);
 
 app.use(oauthRouter);
 app.use('/mcp', mcpRouter);

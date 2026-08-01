@@ -22,7 +22,9 @@ gh --version     # GitHub CLI (optional)
 
 ---
 
-## Step 1 — Store Twilio Credentials in SSM
+## Step 1 — Store Twilio and OAuth Credentials in SSM
+
+### Twilio Credentials
 
 ```bash
 aws ssm put-parameter \
@@ -42,6 +44,19 @@ aws ssm put-parameter \
 ```
 
 You need: Account SID (`AC...`), API Key SID (`SK...`), and API Key Secret — all from the Twilio console under Account → API Keys.
+
+### OAuth Signing Secret
+
+Generate a random 32+ character secret for HMAC-SHA256 token signing:
+
+```bash
+aws ssm put-parameter \
+  --name /grocerylist/oauth/signingSecret \
+  --value "$(openssl rand -base64 32)" \
+  --type SecureString --region us-west-2
+```
+
+This secret is used to sign and verify all OAuth bearer tokens (authorization codes, access tokens, refresh tokens). It is fetched once per Lambda cold start and cached in-memory. **Rotating this secret invalidates all issued tokens and forces all users to re-authenticate.**
 
 ---
 

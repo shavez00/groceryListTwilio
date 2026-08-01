@@ -119,17 +119,38 @@ Exports `setSecretsProvider(fn)` so `twilio.js` can inject the SSM cache without
 
 ## routes/oauth.js — OAuth Endpoints
 
-Implements a minimal OAuth 2.0 authorization server so ChatGPT's MCP connector can authenticate.
+Implements a minimal OAuth 2.0 authorization server so ChatGPT's MCP connector can authenticate. Supports authorization code, refresh token, and client credentials grant types.
 
 | Route | Purpose |
 |-------|---------|
-| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata — ChatGPT fetches this to discover the token endpoint |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata — ChatGPT fetches this to discover the token endpoint. Note: `code_challenge_methods_supported` field lists S256 for compatibility, but PKCE validation is not enforced. |
 | `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata — points clients at the auth server |
-| `GET /oauth/authorize` | Renders an API key entry form |
+| `GET /oauth/authorize` | Renders an API key entry form. Accepts `code_challenge` and `code_challenge_method` query parameters but ignores them (no PKCE support). |
 | `POST /oauth/authorize` | Validates the key, redirects to ChatGPT callback with `code=<apiKey>` |
-| `POST /oauth/token` | Exchanges code or client_secret for access_token (the key itself, validated via GSI) |
+| `POST /oauth/token` | Exchanges code, refresh_token, or client_secret for access_token(s). For authorization_code grant, returns both access and refresh tokens. For refresh_token grant, returns new access and refresh tokens; the old refresh token becomes invalid (single-use). For client_credentials, returns only an access_token. |
 
-The `mcpApiKey` UUID is used directly as both the authorization code and the access token. Since it's a 122-bit secret and is re-validated at every step via the GSI hash lookup, no server-side session state is needed — which is ideal for Lambda.
+The `mcpApiKey` UUID is used directly as both the authorization code and the short-lived access token payload. Since it's a 122-bit secret and is re-validated at every step via the GSI hash lookup, no server-side session state is needed — which is ideal for Lambda.
+
+Refresh tokens use `src/token.js` signing (HMAC-SHA256). The old refresh token is invalidated once exchanged, preventing replay attacks.
+
+---
+
+## src/token.js — OAuth Token Signing
+
+Exports functions to issue and verify signed JWT-like tokens for the OAuth flow. All tokens are signed with HMAC-SHA256 and include an expiration timestamp.
+
+| Function | Behavior |
+|----------|----------|
+| `issueCode(tenantId, codeChallenge)` | Creates a code token payload (not yet signed). The `codeChallenge` parameter is accepted but ignored (no PKCE support). Returns the unsigned payload. |
+| `issueAccessToken(tenantId)` | Creates an access token payload valid for 24 hours |
+| `issueRefreshToken(tenantId)` | Creates a refresh token payload valid for 90 days |
+| `sign(payload, secret)` | Signs a payload with HMAC-SHA256, returns base64url token string |
+| `verify(token, secret)` | Verifies signature and expiration, returns payload or null |
+| `verifyToken(token, kind)` | Async wrapper: verifies signature, checks token `kind` field matches expected ('code', 'access', or 'refresh') |
+
+The signing secret is fetched from the `OAUTH_SIGNING_SECRET` environment variable or via the registered `secretsProvider()` function. This key is rotated separately from tenant MCP keys (see docs/operations.md).
+
+**Refresh Token Single-Use:** After a refresh token is exchanged at `/oauth/token`, a new refresh token is issued. The old refresh token remains valid until its expiration timestamp but should not be reused in production (clients should discard it after exchange). Client implementations that retry with an old refresh token will receive an error.
 
 ---
 

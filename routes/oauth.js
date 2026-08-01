@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const repository = require('../src/repository');
+const token = require('../src/token');
 
 const router = express.Router();
 
@@ -16,7 +17,7 @@ router.get('/.well-known/oauth-authorization-server', (req, res) => {
     authorization_endpoint: `${BASE_URL}/oauth/authorize`,
     token_endpoint: `${BASE_URL}/oauth/token`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code', 'client_credentials'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
     code_challenge_methods_supported: [],
     token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic'],
   });
@@ -32,38 +33,115 @@ router.get('/.well-known/oauth-protected-resource/mcp', (req, res) => {
   });
 });
 
-// Client credentials token exchange.
-// client_secret IS the mcpApiKey UUID. We validate it by hashing and querying
-// the GSI, then return it as the access_token — our existing Bearer auth
-// middleware on /mcp can verify it without any changes.
+// Token exchange endpoint supporting multiple grant types
 router.post('/oauth/token', express.urlencoded({ extended: false }), async (req, res) => {
-  const { grant_type, code, client_secret } = req.body;
-
-  // Resolve the raw API key from whichever grant type was used
-  let apiKey;
-  if (grant_type === 'authorization_code') {
-    apiKey = code;
-  } else if (grant_type === 'client_credentials') {
-    apiKey = client_secret || extractBasicSecret(req.headers.authorization);
-  } else {
-    return res.status(400).json({ error: 'unsupported_grant_type' });
-  }
-
-  if (!apiKey) {
-    return res.status(401).json({ error: 'invalid_grant', error_description: 'Missing code or client_secret' });
-  }
+  const { grant_type, code, refresh_token: refreshTokenStr, client_secret } = req.body;
 
   try {
-    const hash = crypto.createHash('sha256').update(apiKey.trim()).digest('hex');
-    const tenant = await repository.getTenantByApiKeyHash(hash);
-    if (!tenant) {
-      return res.status(401).json({ error: 'invalid_grant', error_description: 'Invalid credentials' });
+    if (grant_type === 'authorization_code') {
+      // Authorization code grant: validate code and issue tokens
+      let apiKey = code;
+      if (!apiKey) {
+        return res.status(401).json({ error: 'invalid_grant', error_description: 'Missing code' });
+      }
+
+      // Try to parse as signed token first
+      let secret = await token.getSecret();
+      const codePayload = token.verify(apiKey, secret);
+
+      if (codePayload) {
+        // It's a signed token — validate it's actually a code token
+        if (codePayload.k !== 'code') {
+          return res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid token kind' });
+        }
+        // Validate tenant exists
+        const tenant = await repository.getTenant(codePayload.t);
+        if (!tenant) {
+          return res.status(400).json({ error: 'invalid_grant', error_description: 'Tenant not found' });
+        }
+      } else {
+        // Treat as raw API key (legacy fallback)
+        const hash = crypto.createHash('sha256').update(apiKey.trim()).digest('hex');
+        const tenant = await repository.getTenantByApiKeyHash(hash);
+        if (!tenant) {
+          return res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid credentials' });
+        }
+      }
+
+      // Issue new tokens
+      const tenantId = codePayload ? codePayload.t : (await repository.getTenantByApiKeyHash(crypto.createHash('sha256').update(apiKey.trim()).digest('hex'))).tenantId;
+      const accessPayload = token.issueAccessToken(tenantId);
+      const refreshPayload = token.issueRefreshToken(tenantId);
+      const accessToken = token.sign(accessPayload, secret);
+      const refreshToken = token.sign(refreshPayload, secret);
+
+      return res.json({
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_in: token.ACCESS_TTL,
+        token_type: 'bearer',
+      });
+    } else if (grant_type === 'refresh_token') {
+      // Refresh token grant: validate refresh token and issue new tokens
+      if (!refreshTokenStr) {
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'Missing refresh_token' });
+      }
+
+      const refreshPayload = await token.verifyToken(refreshTokenStr, 'refresh');
+      if (!refreshPayload) {
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired refresh_token' });
+      }
+
+      // Check if refresh token has been revoked (single-use enforcement)
+      const tokenHash = token.hashToken(refreshTokenStr);
+      const isRevoked = await repository.isRefreshTokenRevoked(refreshPayload.t, tokenHash);
+      if (isRevoked) {
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'Refresh token has been revoked' });
+      }
+
+      // Validate tenant still exists
+      const tenant = await repository.getTenant(refreshPayload.t);
+      if (!tenant) {
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'Tenant not found' });
+      }
+
+      // Issue new tokens
+      const accessPayload = token.issueAccessToken(refreshPayload.t);
+      const newRefreshPayload = token.issueRefreshToken(refreshPayload.t);
+      const secret = await token.getSecret();
+      const accessToken = token.sign(accessPayload, secret);
+      const newRefreshToken = token.sign(newRefreshPayload, secret);
+
+      // Revoke the old refresh token (single-use enforcement)
+      await repository.revokeRefreshToken(refreshPayload.t, tokenHash);
+
+      return res.json({
+        access_token: accessToken,
+        refresh_token: newRefreshToken,
+        expires_in: token.ACCESS_TTL,
+        token_type: 'bearer',
+      });
+    } else if (grant_type === 'client_credentials') {
+      // Client credentials grant: validate client_secret (mcpApiKey) and issue access token only
+      const apiKey = client_secret || extractBasicSecret(req.headers.authorization);
+      if (!apiKey) {
+        return res.status(401).json({ error: 'invalid_grant', error_description: 'Missing client_secret' });
+      }
+
+      const hash = crypto.createHash('sha256').update(apiKey.trim()).digest('hex');
+      const tenant = await repository.getTenantByApiKeyHash(hash);
+      if (!tenant) {
+        return res.status(401).json({ error: 'invalid_grant', error_description: 'Invalid credentials' });
+      }
+
+      return res.json({
+        access_token: apiKey.trim(),
+        token_type: 'bearer',
+        expires_in: 86400,
+      });
+    } else {
+      return res.status(400).json({ error: 'unsupported_grant_type' });
     }
-    return res.json({
-      access_token: apiKey.trim(),
-      token_type: 'bearer',
-      expires_in: 86400,
-    });
   } catch (err) {
     console.error('OAuth token error:', { message: err.message });
     return res.status(500).json({ error: 'server_error' });

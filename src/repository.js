@@ -1,7 +1,7 @@
 'use strict';
 
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 
 const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
@@ -91,6 +91,27 @@ async function getTenant(tenantId) {
   return result.Item ?? null;
 }
 
+// Atomically add a refresh token hash to the revocation set
+async function revokeRefreshToken(tenantId, tokenHash) {
+  await dynamo.send(new UpdateCommand({
+    TableName: TENANTS_TABLE,
+    Key: { tenantId },
+    UpdateExpression: 'ADD revokedRefreshTokenHashes :hash',
+    ExpressionAttributeValues: { ':hash': new Set([tokenHash]) },
+  }));
+}
+
+// Check if a refresh token hash has been revoked
+async function isRefreshTokenRevoked(tenantId, tokenHash) {
+  const result = await dynamo.send(new GetCommand({
+    TableName: TENANTS_TABLE,
+    Key: { tenantId },
+  }));
+  if (!result.Item) return false;
+  const revokedSet = result.Item.revokedRefreshTokenHashes ?? new Set();
+  return revokedSet.has(tokenHash);
+}
+
 module.exports = {
   readList,
   writeList,
@@ -98,4 +119,6 @@ module.exports = {
   isAuthorized,
   getTenantByApiKeyHash,
   getTenant,
+  revokeRefreshToken,
+  isRefreshTokenRevoked,
 };

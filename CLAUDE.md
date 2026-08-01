@@ -59,8 +59,11 @@ test/
   - Discovery: `https://grocerylist.vezcore.com/.well-known/oauth-authorization-server`
 - **DynamoDB tables:** `GroceryTenants` (one row per family), `GroceryLists` (one row per list per family)
 - **DynamoDB GSI:** `mcpApiKeyHash-index` on `GroceryTenants` — enables O(1) bearer token auth lookup
-- **SSM parameters:** `/grocerylist/twilio/accountSID`, `/grocerylist/twilio/apiKeySID`, `/grocerylist/twilio/apiKeySecret`
+- **SSM parameters:**
+  - `/grocerylist/twilio/accountSID`, `/grocerylist/twilio/apiKeySID`, `/grocerylist/twilio/apiKeySecret` — Twilio credentials
+  - `/grocerylist/oauth/signingSecret` — HMAC-SHA256 secret for OAuth token signing (required for all OAuth flows)
 - **Twilio auth:** API Key (SK...) + Account SID (AC...) — not Auth Token. Credentials fetched from SSM at Lambda cold start and cached in-memory.
+- **OAuth auth:** Bearer tokens signed with `/grocerylist/oauth/signingSecret`. Signing secret fetched once per Lambda cold start and cached.
 
 ## Multi-Tenancy
 

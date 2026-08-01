@@ -7,6 +7,7 @@ const { WebStandardStreamableHTTPServerTransport } = require('@modelcontextproto
 const { z } = require('zod');
 const repository = require('./repository');
 const service = require('./service');
+const token = require('./token');
 
 const router = express.Router();
 
@@ -19,12 +20,28 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, Mcp-Session-Id',
 };
 
-// Resolve tenant from bearer token using mcpApiKeyHash GSI
+// Resolve tenant from bearer token — supports both signed tokens and raw API keys
 async function resolveTenant(authHeader) {
   if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
-  const token = authHeader.slice(7).trim();
-  if (!token) return null;
-  const hash = crypto.createHash('sha256').update(token).digest('hex');
+  const bearerToken = authHeader.slice(7).trim();
+  if (!bearerToken) return null;
+
+  // First try to verify as signed token (access token)
+  try {
+    const secret = await token.getSecret();
+    const payload = token.verify(bearerToken, secret);
+    if (payload) {
+      // Validate it's an access token
+      if (payload.k !== 'access') return null;
+      // Fetch tenant record to ensure it still exists
+      return repository.getTenant(payload.t);
+    }
+  } catch (err) {
+    // Continue to try raw API key fallback
+  }
+
+  // Fallback: treat as raw API key
+  const hash = crypto.createHash('sha256').update(bearerToken).digest('hex');
   return repository.getTenantByApiKeyHash(hash);
 }
 

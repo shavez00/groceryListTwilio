@@ -39,7 +39,7 @@ Resources:
         - DynamoDBCrudPolicy:
             TableName: !Ref GroceryListsTable
         - SSMParameterReadPolicy:
-            ParameterName: grocerylist/twilio/*
+            ParameterName: grocerylist/*
       Events:
         SmsWebhook:
           Type: HttpApi

@@ -19,6 +19,9 @@ jest.mock('@aws-sdk/client-ssm', () => ({
   GetParametersCommand: jest.fn(input => ({ input })),
 }));
 
+// Set OAuth signing secret for token verification in tests
+process.env.OAUTH_SIGNING_SECRET = 'test-signing-secret';
+
 const { app } = require('../twilio.js');
 
 // Test tenants
@@ -39,6 +42,19 @@ function setupMcpDynamo({ tenantA = true, tenantB = false, items = [], version =
   mockDynamoSend.mockImplementation(cmd => {
     const table = cmd.input?.TableName;
     const indexName = cmd.input?.IndexName;
+    const key = cmd.input?.Key;
+
+    // GetCommand for GroceryTenants — supports tenant lookup
+    if (table === 'GroceryTenants' && key && !indexName) {
+      const tenantId = key.tenantId;
+      if (tenantA && tenantId === TENANT_A_ID) {
+        return Promise.resolve({ Item: makeTenant(TENANT_A_ID, TENANT_A_HASH) });
+      }
+      if (tenantB && tenantId === TENANT_B_ID) {
+        return Promise.resolve({ Item: makeTenant(TENANT_B_ID, TENANT_B_HASH) });
+      }
+      return Promise.resolve({});
+    }
 
     // GSI query for tenant lookup by hash
     if (table === 'GroceryTenants' && indexName === 'mcpApiKeyHash-index') {
@@ -121,6 +137,92 @@ describe('authentication', () => {
       params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } },
     });
     expect(res.status).toBe(200);
+  });
+
+  test('valid signed access token returns 200', async () => {
+    // Import token module to sign
+    const token = require('../src/token');
+    const accessPayload = token.issueAccessToken(TENANT_A_ID);
+    const signedToken = token.sign(accessPayload, 'test-signing-secret');
+
+    const res = await mcpPost({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } },
+    }, signedToken);
+    expect(res.status).toBe(200);
+  });
+
+  test('expired access token returns 401', async () => {
+    const token = require('../src/token');
+    const expiredPayload = {
+      t: TENANT_A_ID,
+      k: 'access',
+      exp: Math.floor(Date.now() / 1000) - 3600, // 1 hour in the past
+    };
+    const signedToken = token.sign(expiredPayload, 'test-signing-secret');
+
+    const res = await mcpPost({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } },
+    }, signedToken);
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe('invalid_token');
+  });
+
+  test('refresh-kind token used as bearer returns 401', async () => {
+    const token = require('../src/token');
+    const refreshPayload = token.issueRefreshToken(TENANT_A_ID);
+    const signedToken = token.sign(refreshPayload, 'test-signing-secret');
+
+    const res = await mcpPost({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } },
+    }, signedToken);
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe('invalid_token');
+  });
+
+  test('tampered signature returns 401', async () => {
+    const token = require('../src/token');
+    const accessPayload = token.issueAccessToken(TENANT_A_ID);
+    let signedToken = token.sign(accessPayload, 'test-signing-secret');
+
+    // Tamper with the signature
+    const parts = signedToken.split('.');
+    parts[1] = parts[1].split('').reverse().join('');
+    const tamperedToken = parts.join('.');
+
+    const res = await mcpPost({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } },
+    }, tamperedToken);
+    expect(res.status).toBe(401);
+  });
+
+  test('signed token for deleted tenant returns 401', async () => {
+    const token = require('../src/token');
+    const accessPayload = token.issueAccessToken(TENANT_A_ID);
+    const signedToken = token.sign(accessPayload, 'test-signing-secret');
+
+    // Setup mock so tenant is not found
+    setupMcpDynamo({ tenantA: false });
+
+    const res = await mcpPost({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } },
+    }, signedToken);
+    expect(res.status).toBe(401);
+  });
+
+  test('missing Authorization header includes WWW-Authenticate header', async () => {
+    const res = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } });
+    expect(res.status).toBe(401);
+    expect(res.headers['www-authenticate']).toBeDefined();
+    expect(res.headers['www-authenticate']).toContain('Bearer');
   });
 });
 

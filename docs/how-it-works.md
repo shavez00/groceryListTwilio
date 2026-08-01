@@ -127,6 +127,8 @@ Every MCP request includes `Authorization: Bearer <mcpApiKey>`. The server SHA-2
 ### OAuth (for ChatGPT connection setup)
 ChatGPT uses an OAuth 2.0 authorization code flow to establish the connection. When you first connect, ChatGPT redirects you to `https://grocerylist.vezcore.com/oauth/authorize` where you enter your `mcpApiKey`. The server validates it, redirects back to ChatGPT, and ChatGPT exchanges the code for a bearer token at `/oauth/token`. After setup, ChatGPT sends the bearer token automatically on every request.
 
+**Refresh Token Security:** Refresh tokens are single-use. Once exchanged for a new access token and refresh token, the old refresh token becomes invalid. Attempting to reuse a consumed refresh token returns an error, forcing re-authentication. This prevents replay attacks if a token is compromised.
+
 ---
 
 ## Multi-Tenancy
